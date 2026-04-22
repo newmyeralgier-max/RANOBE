@@ -73,8 +73,12 @@ RANOBES_CHAPTER_HTML = """
 <h1 class="title">Chapter 1: Alpha</h1>
 <div class="text" id="arrticle">
   <p>First paragraph.</p>
+  <div class="ad-block"><p>AD: buy premium</p></div>
   <p>Second <i>paragraph</i>.</p>
-</div></div>
+  <div class="share"><span>share</span><div class="inner"><p>ignored-too</p></div></div>
+  <p>Third paragraph after the ads.</p>
+</div>
+<div class="footer">footer that should not be part of the chapter</div>
 </body></html>
 """
 
@@ -123,6 +127,12 @@ def test_ranobes_adapter_end_to_end(monkeypatch, tmp_path):
     assert body.startswith("# Chapter 1: Alpha")
     assert "First paragraph." in body
     assert "Second paragraph." in body
+    # Regression: nested <div> blocks (ads, share widgets) inside #arrticle
+    # used to truncate the match at the first </div>. We now walk balanced
+    # div depth, so paragraphs AFTER the nested block must still be captured.
+    assert "Third paragraph after the ads." in body
+    # And the footer outside #arrticle must NOT leak in.
+    assert "footer that should not be part" not in body
 
     meta = json.loads((out_dir / "meta.json").read_text(encoding="utf-8"))
     assert meta["title"] == "Horror Game Developer"

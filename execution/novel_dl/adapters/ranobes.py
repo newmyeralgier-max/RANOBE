@@ -27,10 +27,10 @@ _TITLE_RE = re.compile(
 _META_RE = re.compile(
     r'<meta\s+(?:name|property)="([^"]+)"\s+content="([^"]*)"', re.IGNORECASE
 )
-_ARTICLE_BLOCK_RE = re.compile(
-    r'<div[^>]*id=["\']arrticle["\'][^>]*>(.*?)</div>\s*</div>',
-    re.DOTALL | re.IGNORECASE,
+_ARTICLE_OPEN_RE = re.compile(
+    r'<div[^>]*id=["\']arrticle["\'][^>]*>', re.IGNORECASE,
 )
+_DIV_TAG_RE = re.compile(r"<(/?)div\b[^>]*>", re.IGNORECASE)
 _ARTICLE_PARA_RE = re.compile(r"<p[^>]*>(.*?)</p>", re.DOTALL | re.IGNORECASE)
 _CHAPTER_NUM_HINT_RE = re.compile(r"chapter\s+(\d+)", re.IGNORECASE)
 
@@ -153,12 +153,11 @@ class RanobesAdapter(SiteAdapter):
         html = fetch_html(chapter.url)
         title = chapter.title or _extract_chapter_title(html) or "Untitled"
 
-        block_match = _ARTICLE_BLOCK_RE.search(html)
-        if not block_match:
+        block = _extract_article_block(html)
+        if block is None:
             chapter.text = ""
             return chapter
 
-        block = block_match.group(1)
         paragraphs = _ARTICLE_PARA_RE.findall(block)
         if paragraphs:
             parts = [normalize_text(strip_tags(p)) for p in paragraphs]
@@ -171,6 +170,33 @@ class RanobesAdapter(SiteAdapter):
 
 
 # ---- helpers -------------------------------------------------------------
+
+def _extract_article_block(html: str) -> str | None:
+    """Return the inner HTML of ``<div id="arrticle">`` with balanced ``<div>``.
+
+    Ranobes wraps the chapter in ``#arrticle`` but sprinkles nested ``<div>``
+    blocks (ads, share buttons) inside it, so a non-greedy regex stops at the
+    first ``</div>`` and only captures the opening paragraphs. We instead walk
+    every ``<div>`` / ``</div>`` token after the opening tag, counting depth,
+    and cut the block off at the matching close tag.
+    """
+    open_match = _ARTICLE_OPEN_RE.search(html)
+    if open_match is None:
+        return None
+    start = open_match.end()
+    depth = 1
+    pos = start
+    for tag_match in _DIV_TAG_RE.finditer(html, pos):
+        is_close = tag_match.group(1) == "/"
+        if is_close:
+            depth -= 1
+            if depth == 0:
+                return html[start:tag_match.start()]
+        else:
+            depth += 1
+    # Unbalanced markup — return whatever we have so the caller still gets text.
+    return html[start:]
+
 
 def _extract_data_json(html: str) -> dict | None:
     m = _DATA_RE.search(html)
