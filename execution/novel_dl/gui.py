@@ -77,6 +77,7 @@ class NovelDownloaderApp:
 
         self._build_widgets()
         self._set_state_idle()
+        _install_layout_agnostic_clipboard_bindings(self.root)
         self.root.after(100, self._drain_messages)
 
     # ---- UI layout ------------------------------------------------------
@@ -347,6 +348,63 @@ def _open_in_file_manager(path: Path) -> None:
             subprocess.Popen(["xdg-open", str(path)])
     except Exception:  # pragma: no cover
         pass
+
+
+def _install_layout_agnostic_clipboard_bindings(root: tk.Misc) -> None:
+    """Make Ctrl+C/V/X/A work regardless of keyboard layout.
+
+    Tk's default clipboard shortcuts are bound to Latin keysyms
+    (``<Control-v>`` etc.), so when the user has Russian (or any non-Latin)
+    layout active, the events arrive as ``<Control-Cyrillic_em>`` and Tk
+    silently does nothing. We bind both the Latin keysyms and their
+    Cyrillic twins on the same physical keys to the standard virtual
+    clipboard events, at the ``TEntry`` / ``Entry`` / ``Text`` class level so
+    every text widget inherits the fix.
+    """
+    # Latin keysym -> (Cyrillic keysym on same physical key, virtual event).
+    mapping = {
+        "v": ("Cyrillic_em", "<<Paste>>"),
+        "c": ("Cyrillic_es", "<<Copy>>"),
+        "x": ("Cyrillic_che", "<<Cut>>"),
+        "a": ("Cyrillic_ef", "<<SelectAll>>"),
+    }
+
+    def make_handler(virtual_event: str):
+        def handler(event: "tk.Event") -> str:
+            event.widget.event_generate(virtual_event)
+            return "break"
+        return handler
+
+    for widget_class in ("TEntry", "Entry", "Text"):
+        for latin, (cyr, virt) in mapping.items():
+            handler = make_handler(virt)
+            # Bind both cases of the Cyrillic key; Latin keysyms are already
+            # wired by Tk itself, but we re-bind them too so the <<SelectAll>>
+            # case (which Tk does NOT bind by default on Entry) works.
+            for seq in (
+                f"<Control-{latin}>",
+                f"<Control-{latin.upper()}>",
+                f"<Control-{cyr}>",
+            ):
+                try:
+                    root.bind_class(widget_class, seq, handler)
+                except tk.TclError:
+                    # Unknown keysym on this Tk build — harmless, skip it.
+                    pass
+
+    # Tk doesn't ship a default <<SelectAll>> handler for ttk.Entry/Entry;
+    # wire one that selects the whole content.
+    def select_all_entry(event: "tk.Event") -> str:
+        w = event.widget
+        try:
+            w.select_range(0, "end")
+            w.icursor("end")
+        except tk.TclError:
+            pass
+        return "break"
+
+    for widget_class in ("TEntry", "Entry"):
+        root.bind_class(widget_class, "<<SelectAll>>", select_all_entry)
 
 
 def main() -> int:
