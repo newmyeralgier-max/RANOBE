@@ -140,6 +140,30 @@ def test_ranobes_adapter_end_to_end(monkeypatch, tmp_path):
     assert meta["downloaded_chapters"][0]["num"] == 1
 
 
+def test_ranobes_adapter_raises_on_empty_chapter_list(monkeypatch):
+    """If page 1 has no window.__DATA__ we must raise a clear error rather
+    than silently reporting ``0 глав загружено из списка``."""
+    from novel_dl.adapters import ranobes as mod
+    from novel_dl.utils import FetchError
+
+    def fake_fetch(url, **kwargs):
+        if "/chapters/" in url:
+            # Simulate a Cloudflare / anti-bot challenge page.
+            return "<html><body>Just a moment...</body></html>"
+        return RANOBES_BOOK_HTML
+
+    monkeypatch.setattr(mod, "fetch_html", fake_fetch)
+    adapter = RanobesAdapter()
+    try:
+        adapter.fetch_book(
+            "https://ranobes.net/novels/42-horror-game-developer.html"
+        )
+    except FetchError as exc:
+        assert "window.__DATA__" in str(exc) or "глав" in str(exc)
+        return
+    raise AssertionError("expected FetchError when chapter list is empty")
+
+
 # ---- freewebnovel adapter -----------------------------------------------
 
 FWN_BOOK_HTML = """

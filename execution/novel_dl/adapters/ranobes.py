@@ -94,12 +94,23 @@ class RanobesAdapter(SiteAdapter):
         seen_ids: set[str] = set()
         page = 1
         pages_total: int | None = None
+        referer = f"{base}/chapters/{book_id}/"
 
         while True:
             list_url = f"{base}/chapters/{book_id}/page/{page}/"
-            html = fetch_html(list_url)
+            # Pass Referer so ranobes' anti-bot / CDN is less likely to serve
+            # us a challenge page that lacks window.__DATA__.
+            html = fetch_html(list_url, headers={"Referer": referer})
             data = _extract_data_json(html)
             if data is None:
+                if page == 1:
+                    raise FetchError(
+                        "ranobes вернул страницу без списка глав "
+                        f"(window.__DATA__ отсутствует в {list_url}). "
+                        "Скорее всего сработала защита Cloudflare / региональный "
+                        "фильтр. Попробуй: 1) открыть ссылку в браузере один раз "
+                        "(чтобы получить cookie), 2) включить VPN, 3) повторить."
+                    )
                 break
 
             if pages_total is None:
@@ -146,6 +157,12 @@ class RanobesAdapter(SiteAdapter):
         for new_idx, (_, ch) in enumerate(ordered):
             ch.index = new_idx
             result.append(ch)
+        if not result:
+            raise FetchError(
+                "ranobes не вернул ни одной главы. Возможные причины: книга "
+                "снята с сайта, временная ошибка на стороне ranobes, либо "
+                "антибот-защита. Открой ссылку в браузере и попробуй ещё раз."
+            )
         return result
 
     # ---- chapter ---------------------------------------------------------
