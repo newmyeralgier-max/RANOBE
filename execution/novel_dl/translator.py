@@ -13,6 +13,7 @@ dropped request only re-runs one chunk rather than the whole chapter.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import urllib.error
@@ -28,6 +29,18 @@ COHERE_CHAT_URL = "https://api.cohere.com/v2/chat"
 # take >100k tokens, but shorter chunks give better retry behaviour and
 # make progress visible per-chunk rather than per-chapter.
 DEFAULT_CHUNK_CHARS = 6000
+
+# Very low temperature — we're translating, not generating. Anything
+# higher lets the model drift toward "write something in this style"
+# which has produced completely hallucinated output in the past.
+DEFAULT_TEMPERATURE = 0.1
+
+# Firm markers around the source text. The model is instructed to only
+# translate what's between them; this + a clear per-request instruction
+# is what keeps it from echoing examples from the system prompt or
+# free-styling an unrelated scene.
+_SRC_BEGIN = "<<<ENGLISH_SOURCE_BEGIN>>>"
+_SRC_END = "<<<ENGLISH_SOURCE_END>>>"
 
 
 class TranslationError(RuntimeError):
@@ -53,24 +66,79 @@ class TranslatorConfig:
     request_timeout: float = 120.0
     retries: int = 3
     retry_backoff: float = 3.0
+    temperature: float = DEFAULT_TEMPERATURE
+
+
+def _wrap_for_translation(text: str) -> str:
+    """Frame the source text so the model can't mistake it for a prompt.
+
+    Cohere's command-a models will happily continue in the style of any
+    in-prompt examples instead of translating the user's text, and will
+    quietly improvise whole scenes if the temperature is above ~0.2.
+    Wrapping the source between explicit markers and repeating the
+    'translate THIS' instruction at the user-message level fixed both
+    failure modes in testing.
+
+    The "keep interjections short" rule is not decorative — command-a at
+    low temperature goes into a repetition loop on long screams
+    ("Ahhhhhhhh!" -> "А-а-а-а-а-а..." × 8000 chars), blowing the output
+    budget and truncating the rest of the chapter.
+    """
+    return (
+        "Переведи приведённый ниже английский отрывок на русский язык "
+        "литературно и точно. Переводи ИМЕННО тот текст, что находится "
+        f"между маркерами {_SRC_BEGIN} и {_SRC_END}. Не добавляй ничего "
+        "от себя, не пересказывай, не сокращай, не добавляй комментариев, "
+        "не повторяй примеры из системного промпта. Междометия и крики "
+        "(«Ahhh!», «Waaaah!» и т.п.) переводи КОРОТКО — не длиннее 15 "
+        "символов, даже если в оригинале они растянуты. Не зацикливайся "
+        "на повторах одного и того же звука. Выведи только готовый "
+        "русский перевод.\n\n"
+        f"{_SRC_BEGIN}\n{text}\n{_SRC_END}"
+    )
+
+
+# Detect runs of a single non-space character longer than 40 chars,
+# which is a tell-tale sign of command-a's scream-repetition loop.
+_RUNAWAY_CHAR_RE = re.compile(r"(?:(\S)(?:[- ]?\1){40,})")
+# Detect a single short fragment (1-4 non-space chars) repeated >=12 times
+# with optional separators — catches loops like "Бах-Бах-Бах-..." as well
+# as "ха ха ха ха ..." that aren't a single-char run.
+_RUNAWAY_FRAGMENT_RE = re.compile(
+    r"((?:\S{1,4}))(?:[\s\-—.,!?]+\1){12,}", re.IGNORECASE,
+)
+
+
+def _looks_runaway(text: str) -> bool:
+    if _RUNAWAY_CHAR_RE.search(text):
+        return True
+    if _RUNAWAY_FRAGMENT_RE.search(text):
+        return True
+    return False
+
+
+def _too_long_vs_source(translated: str, source: str) -> bool:
+    """Translated Russian is typically ~1.3–2.1× the English source.
+    If we come back with >3.5× the source length it's almost always
+    because the model looped — fail fast and retry.
+    """
+    if len(source) < 200:
+        return False  # too short to trust the ratio heuristic
+    return len(translated) > len(source) * 3.5
 
 
 # ---- translation primitives ----------------------------------------------
 
 def translate_text(text: str, cfg: TranslatorConfig) -> str:
-    """Translate a single block of text with one Cohere request."""
+    """Translate a single block of text with one Cohere request.
+
+    Retries on network failure AND on pathological output (scream
+    repetition loops, or output far longer than the source). The retry
+    nudges temperature up slightly — at 0.1 the model sometimes locks
+    into a bad loop it can't break out of.
+    """
     if not text.strip():
         return ""
-    body = {
-        "model": cfg.model,
-        "messages": [
-            {"role": "system", "content": cfg.system_prompt},
-            {"role": "user", "content": text},
-        ],
-        # Leave temperature/top_p at model defaults — the prompt already
-        # pins the style and we want deterministic-ish translation.
-    }
-    data = json.dumps(body).encode("utf-8")
     headers = {
         "Authorization": f"Bearer {cfg.api_key}",
         "Content-Type": "application/json",
@@ -78,12 +146,41 @@ def translate_text(text: str, cfg: TranslatorConfig) -> str:
     }
     last_err: Exception | None = None
     for attempt in range(1, cfg.retries + 1):
+        temp = cfg.temperature + 0.1 * (attempt - 1)
+        body = {
+            "model": cfg.model,
+            "messages": [
+                {"role": "system", "content": cfg.system_prompt},
+                {"role": "user", "content": _wrap_for_translation(text)},
+            ],
+            "temperature": temp,
+        }
+        data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(COHERE_CHAT_URL, data=data, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=cfg.request_timeout) as resp:
                 raw = resp.read()
             payload = json.loads(raw.decode("utf-8", errors="replace"))
-            return _extract_text_from_cohere(payload)
+            translated = _extract_text_from_cohere(payload)
+            if _looks_runaway(translated):
+                last_err = TranslationError(
+                    "Модель зациклилась на повторах (скрим-петля)."
+                )
+                if attempt < cfg.retries:
+                    time.sleep(cfg.retry_backoff * attempt)
+                    continue
+                raise last_err
+            if _too_long_vs_source(translated, text):
+                last_err = TranslationError(
+                    f"Перевод длиннее оригинала в "
+                    f"{len(translated) / max(1, len(text)):.1f}× "
+                    "раз — вероятно, модель зациклилась."
+                )
+                if attempt < cfg.retries:
+                    time.sleep(cfg.retry_backoff * attempt)
+                    continue
+                raise last_err
+            return translated
         except urllib.error.HTTPError as exc:
             # Read server body so the user sees "model X removed on ..." etc.
             try:
@@ -207,13 +304,28 @@ def translate_folder(
     *, force: bool = False,
     progress: Callable[[str], None] | None = None,
     cancel_event: "threading.Event | None" = None,
+    wanted_numbers: "set[int] | None" = None,
 ) -> list[Path]:
-    """Translate every ``chapter_*.txt`` in ``src_dir`` into ``dst_dir``."""
-    files = sorted(src_dir.glob("chapter_*.txt"))
-    if not files:
+    """Translate every ``chapter_*.txt`` in ``src_dir`` into ``dst_dir``.
+
+    If ``wanted_numbers`` is given, only files whose leading 4-digit
+    chapter number is in the set are translated.
+    """
+    all_files = sorted(src_dir.glob("chapter_*.txt"))
+    if not all_files:
         raise TranslationError(
             f"В папке {src_dir} нет файлов chapter_*.txt — сначала скачай главы."
         )
+    if wanted_numbers is not None:
+        files = [f for f in all_files if _chapter_number(f) in wanted_numbers]
+        if not files:
+            raise TranslationError(
+                f"По указанному диапазону в {src_dir} не нашлось глав. "
+                f"Доступны номера "
+                f"{_format_available_numbers(all_files)}."
+            )
+    else:
+        files = all_files
 
     dst_dir.mkdir(parents=True, exist_ok=True)
     done: list[Path] = []
@@ -260,3 +372,20 @@ def _split_title(raw: str) -> tuple[str, str]:
         body = "\n".join(lines[1:]).lstrip("\n")
         return title, body
     return "", raw
+
+
+_CHAPTER_NUM_RE = re.compile(r"^chapter_(\d{1,6})_")
+
+
+def _chapter_number(path: Path) -> int:
+    m = _CHAPTER_NUM_RE.match(path.name)
+    return int(m.group(1)) if m else -1
+
+
+def _format_available_numbers(files: list[Path]) -> str:
+    nums = sorted({n for n in (_chapter_number(f) for f in files) if n >= 0})
+    if not nums:
+        return "(нет)"
+    if len(nums) <= 6:
+        return ", ".join(str(n) for n in nums)
+    return f"{nums[0]}..{nums[-1]} ({len(nums)} файлов)"

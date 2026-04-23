@@ -133,17 +133,40 @@ def build_epub_from_folder(
     src_dir: Path, out_path: Path, *,
     book_title: str,
     author: str = "",
+    wanted_numbers: set[int] | None = None,
 ) -> Path:
     """Bundle every ``chapter_*.txt`` in ``src_dir`` into a single EPUB 3.
 
-    Chapters are ordered by the 4-digit index in the filename.
+    Chapters are ordered by the 4-digit index in the filename.  If
+    ``wanted_numbers`` is given, only chapters whose number is in the
+    set are bundled.
     """
-    files = [p for p in src_dir.glob("chapter_*.txt")
-             if _CHAPTER_FILE_RE.match(p.name)]
-    if not files:
+    all_files = [p for p in src_dir.glob("chapter_*.txt")
+                 if _CHAPTER_FILE_RE.match(p.name)]
+    if not all_files:
         raise RuntimeError(
             f"В папке {src_dir} нет chapter_*.txt — нечего собирать в EPUB."
         )
+    if wanted_numbers is not None:
+        files = [
+            p for p in all_files
+            if int(_CHAPTER_FILE_RE.match(p.name).group(1)) in wanted_numbers
+        ]
+        if not files:
+            available = sorted({
+                int(_CHAPTER_FILE_RE.match(p.name).group(1))
+                for p in all_files
+            })
+            av_hint = (
+                f"{available[0]}..{available[-1]} ({len(available)} глав)"
+                if len(available) > 6 else ", ".join(str(n) for n in available)
+            )
+            raise RuntimeError(
+                f"По указанному диапазону в {src_dir} нет глав. "
+                f"Доступны: {av_hint}."
+            )
+    else:
+        files = all_files
     files.sort(key=lambda p: int(_CHAPTER_FILE_RE.match(p.name).group(1)))
 
     chapters: list[tuple[str, str, str]] = []  # (href, title, xhtml)

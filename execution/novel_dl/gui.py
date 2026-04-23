@@ -17,6 +17,7 @@ Design goals:
 from __future__ import annotations
 
 import queue
+import re
 import threading
 import tkinter as tk
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from .core import Book, UnsupportedSiteError
 from .downloader import DownloadCancelled, DownloadError, download_chapters
 from .epub import build_epub_from_folder
 from .registry import get_adapter
+from .settings import load_settings, save_settings
 from .translator import (
     DEFAULT_COHERE_MODEL,
     TranslationCancelled,
@@ -115,8 +117,10 @@ class NovelDownloaderApp:
         self._last_out_dir: Path | None = None
 
         self._build_widgets()
+        self._apply_settings(load_settings())
         self._set_state_idle()
         _install_layout_agnostic_clipboard_bindings(self.root)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._drain_messages)
 
     # ---- UI layout ------------------------------------------------------
@@ -203,6 +207,15 @@ class NovelDownloaderApp:
         ttk.Entry(key_row, textvariable=self.cohere_model_var,
                   width=22).pack(side="left", padx=(6, 0))
 
+        key_opt_row = ttk.Frame(tr)
+        key_opt_row.pack(fill="x", padx=8, pady=(0, 2))
+        self.save_api_key_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            key_opt_row,
+            text="Запомнить ключ на этом ПК (в ~/.novel_dl/config.json)",
+            variable=self.save_api_key_var,
+        ).pack(side="left")
+
         prompt_frame = ttk.Frame(tr)
         prompt_frame.pack(fill="x", padx=8, pady=(4, 4))
         ttk.Label(prompt_frame, text="Промпт (редактируемый):",
@@ -215,8 +228,20 @@ class NovelDownloaderApp:
         prompt_sb.pack(side="right", fill="y")
         self.prompt_text.configure(yscrollcommand=prompt_sb.set)
 
+        tr_range_row = ttk.Frame(tr)
+        tr_range_row.pack(fill="x", padx=8, pady=(0, 2))
+        ttk.Label(tr_range_row, text="Переводить главы:").pack(side="left")
+        self.translate_range_var = tk.StringVar(value="all")
+        ttk.Entry(
+            tr_range_row, textvariable=self.translate_range_var, width=22,
+        ).pack(side="left", padx=(6, 10))
+        ttk.Label(
+            tr_range_row, foreground="#555",
+            text="номера глав: 3-200  •  3,5,10-20  •  all",
+        ).pack(side="left")
+
         tr_btns = ttk.Frame(tr)
-        tr_btns.pack(fill="x", padx=8, pady=(2, 8))
+        tr_btns.pack(fill="x", padx=8, pady=(2, 4))
         self.translate_btn = ttk.Button(tr_btns, text="Перевести скачанные",
                                         command=self._on_translate)
         self.translate_btn.pack(side="left")
@@ -225,15 +250,27 @@ class NovelDownloaderApp:
                         variable=self.retranslate_var).pack(
             side="left", padx=(12, 0),
         )
-        self.epub_btn = ttk.Button(tr_btns, text="Собрать EPUB",
+
+        epub_row = ttk.Frame(tr)
+        epub_row.pack(fill="x", padx=8, pady=(2, 8))
+        self.epub_btn = ttk.Button(epub_row, text="Собрать EPUB",
                                    command=self._on_build_epub)
-        self.epub_btn.pack(side="right")
+        self.epub_btn.pack(side="left")
+        ttk.Label(epub_row, text="Источник:").pack(side="left", padx=(12, 4))
         self.epub_source_var = tk.StringVar(value="ru (перевод)")
-        ttk.Label(tr_btns, text="Источник:").pack(side="right", padx=(0, 4))
         ttk.Combobox(
-            tr_btns, textvariable=self.epub_source_var, width=16,
+            epub_row, textvariable=self.epub_source_var, width=16,
             values=["ru (перевод)", "en (оригинал)"], state="readonly",
-        ).pack(side="right", padx=(0, 4))
+        ).pack(side="left")
+        ttk.Label(epub_row, text="Главы:").pack(side="left", padx=(12, 4))
+        self.epub_range_var = tk.StringVar(value="all")
+        ttk.Entry(
+            epub_row, textvariable=self.epub_range_var, width=20,
+        ).pack(side="left")
+        ttk.Label(
+            epub_row, foreground="#555",
+            text="напр. 3-200 или all",
+        ).pack(side="left", padx=(6, 0))
 
         self.progress = ttk.Progressbar(self.root, mode="determinate")
         self.progress.pack(fill="x", padx=10, pady=(0, 4))
@@ -304,6 +341,7 @@ class NovelDownloaderApp:
         self.book_info_var.set("")
         self._set_state_loading()
         self._append_log(f"[site={self._adapter.site_id}] загружаю {url}")
+        self._save_current_settings()
         self._spawn(lambda: self._worker_fetch_book(url))
 
     def _on_pick_dir(self) -> None:
@@ -346,6 +384,7 @@ class NovelDownloaderApp:
             f"Скачиваю {len(indices)} глав (первая {indices[0]}, последняя {indices[-1]}) "
             f"в {out_dir}"
         )
+        self._save_current_settings()
         self._spawn(lambda: self._worker_download(adapter, book, indices,
                                                   out_dir, combined, force,
                                                   self._cancel_event))
@@ -356,6 +395,68 @@ class NovelDownloaderApp:
             self.stop_btn.config(state="disabled")
             self.status_var.set("Останавливаю...")
             self._append_log("Запрошена остановка. Дожидаюсь текущей задачи...")
+
+    # ---- persistent settings -------------------------------------------
+    def _current_settings(self) -> dict[str, object]:
+        return {
+            "url": self.url_var.get(),
+            "output_dir": self.output_var.get(),
+            "range_spec": self.range_var.get(),
+            "combined": bool(self.combined_var.get()),
+            "force": bool(self.force_var.get()),
+            "api_key": self.cohere_key_var.get(),
+            "save_api_key": bool(self.save_api_key_var.get()),
+            "model": self.cohere_model_var.get(),
+            "prompt": self.prompt_text.get("1.0", "end").rstrip("\n"),
+            "translate_range": self.translate_range_var.get(),
+            "retranslate": bool(self.retranslate_var.get()),
+            "epub_range": self.epub_range_var.get(),
+            "epub_source": self.epub_source_var.get(),
+        }
+
+    def _apply_settings(self, s: dict[str, object]) -> None:
+        def _s(key: str, default: str = "") -> str:
+            v = s.get(key, default)
+            return str(v) if v is not None else default
+
+        def _b(key: str, default: bool = False) -> bool:
+            v = s.get(key, default)
+            return bool(v) if v is not None else default
+
+        if _s("url"):
+            self.url_var.set(_s("url"))
+        if _s("output_dir"):
+            self.output_var.set(_s("output_dir"))
+        if _s("range_spec"):
+            self.range_var.set(_s("range_spec"))
+        self.combined_var.set(_b("combined", True))
+        self.force_var.set(_b("force", False))
+        if _s("model"):
+            self.cohere_model_var.set(_s("model"))
+        self.save_api_key_var.set(_b("save_api_key", False))
+        if _b("save_api_key") and _s("api_key"):
+            self.cohere_key_var.set(_s("api_key"))
+        prompt = _s("prompt")
+        if prompt:
+            self.prompt_text.delete("1.0", "end")
+            self.prompt_text.insert("1.0", prompt)
+        if _s("translate_range"):
+            self.translate_range_var.set(_s("translate_range"))
+        self.retranslate_var.set(_b("retranslate", False))
+        if _s("epub_range"):
+            self.epub_range_var.set(_s("epub_range"))
+        if _s("epub_source"):
+            self.epub_source_var.set(_s("epub_source"))
+
+    def _save_current_settings(self) -> None:
+        try:
+            save_settings(self._current_settings())
+        except Exception as exc:  # pragma: no cover
+            self._append_log(f"Не удалось сохранить настройки: {exc}")
+
+    def _on_close(self) -> None:
+        self._save_current_settings()
+        self.root.destroy()
 
     # ---- translate / epub --------------------------------------------
     def _src_dir_for_postprocess(self) -> Path | None:
@@ -398,11 +499,29 @@ class NovelDownloaderApp:
         dst_dir = src_dir.parent / (src_dir.name + "_ru")
         cfg = TranslatorConfig(api_key=api_key, model=model, system_prompt=prompt)
 
-        files_count = sum(1 for _ in src_dir.glob("chapter_*.txt"))
-        if files_count == 0:
+        available_nums = sorted(_chapter_numbers_in(src_dir))
+        if not available_nums:
             messagebox.showwarning(
                 "Нечего переводить",
                 f"В {src_dir} нет файлов chapter_*.txt.",
+            )
+            return
+
+        wanted = _parse_chapter_number_spec(
+            self.translate_range_var.get() or "all", available_nums,
+        )
+        if wanted is None:
+            messagebox.showwarning(
+                "Диапазон перевода",
+                "Не понял диапазон. Примеры: 3-200, 3,5,10-20, all.",
+            )
+            return
+        if not wanted:
+            messagebox.showwarning(
+                "Диапазон перевода",
+                f"По указанному диапазону в папке нет глав. "
+                f"Доступны: {available_nums[0]}..{available_nums[-1]} "
+                f"({len(available_nums)} файлов).",
             )
             return
 
@@ -410,12 +529,15 @@ class NovelDownloaderApp:
         # Create cancel event BEFORE flipping state — see _on_download.
         self._cancel_event = threading.Event()
         self._set_state_downloading()
+        files_count = len(wanted)
         self.progress.config(maximum=files_count, value=0)
         self._append_log(
-            f"Перевод {files_count} глав → {dst_dir} (модель {model})"
+            f"Перевод {files_count} глав (из {len(available_nums)}) "
+            f"→ {dst_dir} (модель {model})"
         )
+        self._save_current_settings()
         self._spawn(lambda: self._worker_translate(
-            src_dir, dst_dir, cfg, force, self._cancel_event,
+            src_dir, dst_dir, cfg, force, self._cancel_event, wanted,
         ))
 
     def _on_build_epub(self) -> None:
@@ -436,10 +558,38 @@ class NovelDownloaderApp:
                 f"Сначала {'переведи' if use_ru else 'скачай'}.",
             )
             return
+
+        available_nums = sorted(_chapter_numbers_in(src_dir))
+        wanted = _parse_chapter_number_spec(
+            self.epub_range_var.get() or "all", available_nums,
+        )
+        if wanted is None:
+            messagebox.showwarning(
+                "Диапазон EPUB",
+                "Не понял диапазон. Примеры: 3-200, 3,5,10-20, all.",
+            )
+            return
+        if not wanted:
+            messagebox.showwarning(
+                "Диапазон EPUB",
+                f"По указанному диапазону в папке нет глав. "
+                f"Доступны: {available_nums[0]}..{available_nums[-1]} "
+                f"({len(available_nums)} файлов).",
+            )
+            return
+
         title = (self._book.title if self._book else raw_dir.name) or raw_dir.name
         author = (self._book.author if self._book else "") or ""
+        suffix_bits: list[str] = []
         if use_ru:
-            title = f"{title} (перевод)"
+            suffix_bits.append("перевод")
+        if wanted != set(available_nums):
+            lo, hi = min(wanted), max(wanted)
+            suffix_bits.append(
+                f"главы {lo}-{hi}" if lo != hi else f"глава {lo}",
+            )
+        if suffix_bits:
+            title = f"{title} ({', '.join(suffix_bits)})"
         epub_path = raw_dir.parent / f"{safe_filename(title)}.epub"
         # EPUB build is fast synchronous stdlib zipfile work; there's no
         # meaningful point to cancel it, so we null out the cancel event
@@ -449,9 +599,12 @@ class NovelDownloaderApp:
         self.stop_btn.config(state="disabled")
         self.status_var.set("Собираю EPUB...")
         self.progress.config(maximum=1, value=0)
-        self._append_log(f"Собираю EPUB из {src_dir} → {epub_path}")
+        self._append_log(
+            f"Собираю EPUB из {src_dir} ({len(wanted)} глав) → {epub_path}"
+        )
+        self._save_current_settings()
         self._spawn(lambda: self._worker_build_epub(
-            src_dir, epub_path, title, author,
+            src_dir, epub_path, title, author, wanted,
         ))
 
     def _on_open_folder(self) -> None:
@@ -517,9 +670,10 @@ class NovelDownloaderApp:
 
     def _worker_translate(self, src_dir: Path, dst_dir: Path,
                            cfg: TranslatorConfig, force: bool,
-                           cancel_event: threading.Event) -> None:
+                           cancel_event: threading.Event,
+                           wanted: set[int]) -> None:
         counter = {"i": 0}
-        total = sum(1 for _ in src_dir.glob("chapter_*.txt"))
+        total = len(wanted)
 
         def progress(msg: str) -> None:
             self._messages.put(_LogMsg(msg))
@@ -532,6 +686,7 @@ class NovelDownloaderApp:
             done = translate_folder(
                 src_dir, dst_dir, cfg,
                 force=force, progress=progress, cancel_event=cancel_event,
+                wanted_numbers=wanted,
             )
         except TranslationCancelled as exc:
             self._messages.put(_Error(
@@ -554,10 +709,12 @@ class NovelDownloaderApp:
         self._messages.put(_TranslateDone(out_dir=dst_dir, count=len(done)))
 
     def _worker_build_epub(self, src_dir: Path, epub_path: Path,
-                            title: str, author: str) -> None:
+                            title: str, author: str,
+                            wanted: set[int]) -> None:
         try:
             build_epub_from_folder(
                 src_dir, epub_path, book_title=title, author=author,
+                wanted_numbers=wanted,
             )
         except Exception as exc:  # pragma: no cover
             self._messages.put(_Error(f"Не удалось собрать EPUB: {exc}"))
@@ -653,6 +810,59 @@ class NovelDownloaderApp:
         self.log.insert("end", text + "\n")
         self.log.see("end")
         self.log.config(state="disabled")
+
+
+_CHAPTER_NUM_RE = re.compile(r"^chapter_(\d{1,6})_")
+
+
+def _chapter_numbers_in(src_dir: Path) -> set[int]:
+    """Return the integer indexes of chapter_NNNN_*.txt files in ``src_dir``."""
+    out: set[int] = set()
+    for p in src_dir.glob("chapter_*.txt"):
+        m = _CHAPTER_NUM_RE.match(p.name)
+        if m:
+            out.add(int(m.group(1)))
+    return out
+
+
+def _parse_chapter_number_spec(spec: str, available: list[int]) -> set[int] | None:
+    """Parse ``3-200`` / ``all`` / ``3,5,10-20`` into a set of chapter numbers.
+
+    Returns ``None`` if the spec is unparseable, and an empty set if the
+    spec is valid but nothing in ``available`` matches it. The distinction
+    matters — the GUI shows different error messages.
+    """
+    spec = (spec or "").strip().lower()
+    if not spec or spec == "all":
+        return set(available)
+    available_set = set(available)
+    result: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo_s, hi_s = part.split("-", 1)
+            lo_s = lo_s.strip()
+            hi_s = hi_s.strip()
+            try:
+                lo = int(lo_s) if lo_s else (min(available) if available else 1)
+                hi = int(hi_s) if hi_s else (max(available) if available else 0)
+            except ValueError:
+                return None
+            if lo > hi:
+                lo, hi = hi, lo
+            for n in range(lo, hi + 1):
+                if n in available_set:
+                    result.add(n)
+        else:
+            try:
+                n = int(part)
+            except ValueError:
+                return None
+            if n in available_set:
+                result.add(n)
+    return result
 
 
 def _open_in_file_manager(path: Path) -> None:

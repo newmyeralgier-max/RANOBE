@@ -479,6 +479,194 @@ def test_epub_builder_produces_valid_archive(tmp_path):
         assert "Second paragraph." in ch1
 
 
+# ---- runaway detection & range spec -------------------------------------
+
+def test_translator_detects_scream_runaway():
+    """command-a loops on long screams. We must refuse to keep such output."""
+    from novel_dl.translator import _looks_runaway
+
+    # Tell-tales from real failures.
+    assert _looks_runaway("«А-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а-а»")
+    assert _looks_runaway("a" * 100)
+    assert _looks_runaway("Бах-Бах-Бах-Бах-Бах-Бах-Бах-Бах-Бах-Бах-Бах-Бах-Бах!")
+    assert _looks_runaway("ха ха ха ха ха ха ха ха ха ха ха ха ха")
+
+    # Legitimate short screams / repetitions must NOT be flagged.
+    assert not _looks_runaway("«А-а-а!» — закричал он.")
+    assert not _looks_runaway("Он сжал кулаки.")
+    assert not _looks_runaway("«Бах!» — прогремело в тишине.")
+    assert not _looks_runaway("Обычный абзац без всяких крайностей.")
+
+
+def test_translator_detects_output_bloat():
+    """If the translation is >3.5x longer than source, something went wrong."""
+    from novel_dl.translator import _too_long_vs_source
+
+    src = "A regular English paragraph. " * 20  # ~600 chars
+    # 1.7x — normal for ru<-en
+    assert not _too_long_vs_source("X" * int(len(src) * 1.7), src)
+    # 4x — broken, model almost certainly looped
+    assert _too_long_vs_source("X" * int(len(src) * 4.0), src)
+    # Short source — heuristic disabled (too little signal)
+    assert not _too_long_vs_source("X" * 10000, "short")
+
+
+def test_translator_translate_text_retries_runaway(monkeypatch):
+    """translate_text must retry when output looks like a scream loop."""
+    from novel_dl import translator as mod
+
+    calls = {"n": 0}
+
+    class FakeResp:
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def read(self) -> bytes:
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a) -> None:
+            pass
+
+    def fake_urlopen(req, timeout):  # noqa: ARG001
+        calls["n"] += 1
+        # First 2 calls return a runaway; 3rd call returns clean output.
+        if calls["n"] < 3:
+            text = "А" * 200
+        else:
+            text = "Переведённый абзац."
+        import json as _j
+        body = _j.dumps({"message": {"content": [{"type": "text", "text": text}]}})
+        return FakeResp(body.encode("utf-8"))
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(mod.time, "sleep", lambda *_a, **_k: None)
+
+    cfg = mod.TranslatorConfig(
+        api_key="x", model="m", system_prompt="p", retries=3, retry_backoff=0.0,
+    )
+    got = mod.translate_text("Some English paragraph.", cfg)
+    assert got == "Переведённый абзац."
+    assert calls["n"] == 3
+
+
+def test_epub_range_filter(tmp_path):
+    """build_epub_from_folder should only include wanted chapter numbers."""
+    import zipfile
+
+    from novel_dl.epub import build_epub_from_folder
+
+    src = tmp_path / "chs"
+    src.mkdir()
+    for n in (1, 2, 3, 4, 5):
+        (src / f"chapter_{n:04d}_ch.txt").write_text(
+            f"# Ch {n}\n\nBody {n}.\n", encoding="utf-8",
+        )
+    out = tmp_path / "out.epub"
+    build_epub_from_folder(src, out, book_title="T", wanted_numbers={2, 3, 4})
+    with zipfile.ZipFile(out) as zf:
+        names = zf.namelist()
+        assert "OEBPS/ch0001.xhtml" in names  # renumbered starting at 1
+        assert "OEBPS/ch0002.xhtml" in names
+        assert "OEBPS/ch0003.xhtml" in names
+        assert "OEBPS/ch0004.xhtml" not in names
+        body_1 = zf.read("OEBPS/ch0001.xhtml").decode("utf-8")
+        assert "Body 2" in body_1  # first wanted chapter
+
+
+def test_translator_range_filter(tmp_path, monkeypatch):
+    """translate_folder must only translate wanted chapter numbers."""
+    from novel_dl import translator as mod
+
+    src = tmp_path / "src"
+    src.mkdir()
+    for n in (1, 2, 3):
+        (src / f"chapter_{n:04d}_c.txt").write_text(
+            f"# T{n}\n\nBody {n}.\n", encoding="utf-8",
+        )
+    dst = tmp_path / "ru"
+    monkeypatch.setattr(mod, "translate_text", lambda text, cfg: f"<<{text[:10]}>>")
+    cfg = mod.TranslatorConfig(api_key="x", model="m", system_prompt="p")
+    got = mod.translate_folder(src, dst, cfg, wanted_numbers={2})
+    assert len(got) == 1
+    assert got[0].name == "chapter_0002_c.txt"
+    assert not (dst / "chapter_0001_c.txt").exists()
+    assert not (dst / "chapter_0003_c.txt").exists()
+
+
+def test_settings_roundtrip(tmp_path, monkeypatch):
+    """save_settings -> load_settings returns the same values, and the API
+    key is suppressed from disk when save_api_key=False."""
+    from novel_dl import settings as mod
+
+    monkeypatch.setattr(mod, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(mod, "CONFIG_PATH", tmp_path / "config.json")
+
+    # save_api_key=True → key persists
+    mod.save_settings({
+        "url": "https://x.test/book.html",
+        "api_key": "sk-secret",
+        "save_api_key": True,
+        "range_spec": "3-200",
+        "translate_range": "3-50",
+        "epub_range": "1-100",
+        "prompt": "custom prompt",
+    })
+    loaded = mod.load_settings()
+    assert loaded["url"] == "https://x.test/book.html"
+    assert loaded["api_key"] == "sk-secret"
+    assert loaded["translate_range"] == "3-50"
+    assert loaded["prompt"] == "custom prompt"
+
+    # save_api_key=False → key dropped on disk (but other fields kept)
+    mod.save_settings({**loaded, "save_api_key": False})
+    loaded2 = mod.load_settings()
+    assert loaded2["api_key"] == ""
+    assert loaded2["url"] == "https://x.test/book.html"
+
+
+def test_settings_load_tolerates_missing_and_garbage(tmp_path, monkeypatch):
+    """Missing / corrupted config must fall back to defaults, not crash."""
+    from novel_dl import settings as mod
+
+    monkeypatch.setattr(mod, "CONFIG_DIR", tmp_path)
+    cfg_path = tmp_path / "config.json"
+    monkeypatch.setattr(mod, "CONFIG_PATH", cfg_path)
+
+    assert mod.load_settings() == mod.DEFAULTS
+
+    cfg_path.write_text("not json at all{{{", encoding="utf-8")
+    assert mod.load_settings() == mod.DEFAULTS
+
+    # Unknown keys are ignored but defaults still present.
+    cfg_path.write_text('{"url": "u", "totally_unknown_key": 42}',
+                        encoding="utf-8")
+    out = mod.load_settings()
+    assert out["url"] == "u"
+    assert "totally_unknown_key" not in out
+
+
+def test_parse_chapter_number_spec_basic():
+    """The range parser used by Translate/EPUB panels must handle the
+    user-facing shorthand (3-200, 3,5,7, all, -, etc.) correctly."""
+    from novel_dl.gui import _parse_chapter_number_spec
+
+    available = [1, 2, 3, 4, 5, 10, 200]
+    assert _parse_chapter_number_spec("all", available) == set(available)
+    assert _parse_chapter_number_spec("", available) == set(available)
+    assert _parse_chapter_number_spec("3-5", available) == {3, 4, 5}
+    assert _parse_chapter_number_spec("3,5,10", available) == {3, 5, 10}
+    # Out-of-range numbers get silently dropped (available-filter).
+    assert _parse_chapter_number_spec("100-250", available) == {200}
+    # Open range (3-) means from 3 to max
+    assert _parse_chapter_number_spec("3-", available) == {3, 4, 5, 10, 200}
+    # Bad input → None
+    assert _parse_chapter_number_spec("abc", available) is None
+    assert _parse_chapter_number_spec("3-abc", available) is None
+
+
 if __name__ == "__main__":
     import pytest
 
