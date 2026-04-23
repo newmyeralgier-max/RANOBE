@@ -255,23 +255,31 @@ class NovelDownloaderApp:
         self.load_btn.config(state="normal")
         self.download_btn.config(state="disabled")
         self.stop_btn.config(state="disabled")
+        self.translate_btn.config(state="normal")
+        self.epub_btn.config(state="normal")
 
     def _set_state_loading(self) -> None:
         self.load_btn.config(state="disabled")
         self.download_btn.config(state="disabled")
         self.stop_btn.config(state="disabled")
+        self.translate_btn.config(state="disabled")
+        self.epub_btn.config(state="disabled")
         self.status_var.set("Загружаю список глав...")
 
     def _set_state_ready(self) -> None:
         self.load_btn.config(state="normal")
         self.download_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
+        self.translate_btn.config(state="normal")
+        self.epub_btn.config(state="normal")
 
     def _set_state_downloading(self) -> None:
         self.load_btn.config(state="disabled")
         self.download_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
-        self.status_var.set("Скачиваю...")
+        self.translate_btn.config(state="disabled")
+        self.epub_btn.config(state="disabled")
+        self.status_var.set("Работаю...")
 
     # ---- button handlers -----------------------------------------------
     def _on_load_book(self) -> None:
@@ -286,6 +294,14 @@ class NovelDownloaderApp:
             messagebox.showerror("Сайт не поддержан", str(exc))
             return
 
+        # Loading a new book invalidates the previous "last download"
+        # folder — otherwise Translate/EPUB/Open-folder would still
+        # target the old book while the new one is displayed.
+        self._last_out_dir = None
+        self.open_btn.config(state="disabled")
+        self._book = None
+        self.book_title_var.set("— загружаю... —")
+        self.book_info_var.set("")
         self._set_state_loading()
         self._append_log(f"[site={self._adapter.site_id}] загружаю {url}")
         self._spawn(lambda: self._worker_fetch_book(url))
@@ -316,16 +332,20 @@ class NovelDownloaderApp:
         out_dir = out_root / safe_filename(self._book.slug or self._book.title)
         combined = (out_dir / "combined.txt") if self.combined_var.get() else None
 
+        adapter = self._adapter
+        book = self._book
+        force = self.force_var.get()
+        # Create the cancel event BEFORE flipping UI state — otherwise a
+        # very quick Stop click between "state=downloading" (stop_btn
+        # enabled) and the assignment below would set a stale / missing
+        # event that the worker never sees.
+        self._cancel_event = threading.Event()
         self._set_state_downloading()
         self.progress.config(maximum=len(indices), value=0)
         self._append_log(
             f"Скачиваю {len(indices)} глав (первая {indices[0]}, последняя {indices[-1]}) "
             f"в {out_dir}"
         )
-        adapter = self._adapter
-        book = self._book
-        force = self.force_var.get()
-        self._cancel_event = threading.Event()
         self._spawn(lambda: self._worker_download(adapter, book, indices,
                                                   out_dir, combined, force,
                                                   self._cancel_event))
@@ -386,13 +406,14 @@ class NovelDownloaderApp:
             )
             return
 
+        force = self.retranslate_var.get()
+        # Create cancel event BEFORE flipping state — see _on_download.
+        self._cancel_event = threading.Event()
         self._set_state_downloading()
         self.progress.config(maximum=files_count, value=0)
         self._append_log(
             f"Перевод {files_count} глав → {dst_dir} (модель {model})"
         )
-        force = self.retranslate_var.get()
-        self._cancel_event = threading.Event()
         self._spawn(lambda: self._worker_translate(
             src_dir, dst_dir, cfg, force, self._cancel_event,
         ))
@@ -420,7 +441,13 @@ class NovelDownloaderApp:
         if use_ru:
             title = f"{title} (перевод)"
         epub_path = raw_dir.parent / f"{safe_filename(title)}.epub"
+        # EPUB build is fast synchronous stdlib zipfile work; there's no
+        # meaningful point to cancel it, so we null out the cancel event
+        # and force the Stop button off after the usual state transition.
+        self._cancel_event = None
         self._set_state_downloading()
+        self.stop_btn.config(state="disabled")
+        self.status_var.set("Собираю EPUB...")
         self.progress.config(maximum=1, value=0)
         self._append_log(f"Собираю EPUB из {src_dir} → {epub_path}")
         self._spawn(lambda: self._worker_build_epub(

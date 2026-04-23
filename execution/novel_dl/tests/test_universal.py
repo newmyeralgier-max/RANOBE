@@ -313,6 +313,39 @@ def test_download_respects_cancel_event(tmp_path):
 
 # ---- ranobes adapter: strip ad JS from chapter body -----------------------
 
+def test_ranobes_js_regex_does_not_eat_english_prose():
+    """The JS-paragraph heuristic must not munch lines like 'Let's go.' or
+    'Window. The sun poured in.' that happen to start with a JS keyword."""
+    from novel_dl.adapters.ranobes import _JS_LINE_RE
+
+    false_positives = [
+        "Let's go.",
+        "Let it be.",
+        "Var was his name, not a variable.",
+        "Window. The sun poured in through the blinds.",
+        "Document your work, then move on.",
+        "Function over form, always.",
+        "Const folks called him Old.",
+    ]
+    for s in false_positives:
+        assert not _JS_LINE_RE.match(s), f"regex wrongly stripped: {s!r}"
+
+    # True positives — these MUST match.
+    true_positives = [
+        "var adx_id_10448 = document.getElementById('bg-ssp-10448');",
+        "let x = 1;",
+        "const y = 2;",
+        "function foo(a, b) {",
+        "window.pubadxtag.push({zoneid: 10448});",
+        "document.getElementById('bg-ssp');",
+        "adx_id_10448.something",
+        "pubadxtag.push(...)",
+        "yaContextCb.push(...);",
+    ]
+    for s in true_positives:
+        assert _JS_LINE_RE.match(s), f"regex missed: {s!r}"
+
+
 def test_ranobes_adapter_strips_ad_scripts(monkeypatch):
     """Ranobes injects ``<script>`` ad blocks and, occasionally, paragraphs
     whose content is pure JavaScript. None of that should survive into the
@@ -362,6 +395,34 @@ def test_translator_split_respects_paragraph_boundaries():
     joined = "\n\n".join(chunks)
     assert joined.count("para one") == 50
     assert joined.count("para three") == 50
+
+
+def test_translator_refuses_to_write_empty_translation(tmp_path, monkeypatch):
+    """Cohere occasionally returns an empty string for a filter trip. We
+    must raise rather than produce a .txt with just the header and blank
+    body — otherwise the user's library gets silently corrupted."""
+    from novel_dl import translator as mod
+
+    (tmp_path / "src").mkdir()
+    src = tmp_path / "src" / "chapter_0001_x.txt"
+    src.write_text("# Title\n\nReal English paragraph here.\n", encoding="utf-8")
+    dst = tmp_path / "dst" / "chapter_0001_x.txt"
+
+    # Stub out the network. Title translates, body translates to "" (silent
+    # refusal) — this is the scenario we need to catch.
+    def fake_translate(text, cfg):
+        return "Заголовок" if text.strip() == "Title" else ""
+
+    monkeypatch.setattr(mod, "translate_text", fake_translate)
+
+    cfg = mod.TranslatorConfig(api_key="x", model="m", system_prompt="p")
+    try:
+        mod.translate_chapter_file(src, dst, cfg)
+    except mod.TranslationError as exc:
+        assert "пуст" in str(exc).lower()
+        assert not dst.exists(), "empty translation must NOT be written"
+        return
+    raise AssertionError("expected TranslationError on empty translation body")
 
 
 def test_translator_extract_v2_response_shape():

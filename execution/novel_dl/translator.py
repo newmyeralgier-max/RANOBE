@@ -166,9 +166,13 @@ def translate_chapter_file(
 
     Preserves the ``# Title`` header (we translate the title separately so
     it ends up in Russian too) and the paragraph structure of the body.
+    Refuses to write an empty translated file if the source had text —
+    that way a silent model refusal surfaces as an error rather than as
+    a corrupted library.
     """
     raw = src.read_text(encoding="utf-8")
     title, body = _split_title(raw)
+    source_had_text = bool(body.strip())
 
     if cancel_event is not None and cancel_event.is_set():
         raise TranslationCancelled("Отменено до начала главы.")
@@ -185,8 +189,15 @@ def translate_chapter_file(
             progress(f"    chunk {i}/{len(chunks)} ({len(chunk)} chars)")
         translated_parts.append(translate_text(chunk, cfg))
 
-    dst.parent.mkdir(parents=True, exist_ok=True)
     translated_body = "\n\n".join(p for p in translated_parts if p).strip()
+    if source_had_text and not translated_body:
+        # Cohere returned nothing meaningful — don't ship an empty .txt.
+        raise TranslationError(
+            f"Cohere вернул пустой перевод для {src.name}. Возможно, "
+            "модель отказалась переводить контент или промпт спорный."
+        )
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
     header = f"# {translated_title or title or 'Без названия'}"
     dst.write_text(f"{header}\n\n{translated_body}\n", encoding="utf-8")
 

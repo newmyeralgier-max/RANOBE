@@ -42,11 +42,22 @@ _STYLE_RE = re.compile(r"<style\b[^>]*>.*?</style>", re.DOTALL | re.IGNORECASE)
 _NOSCRIPT_RE = re.compile(r"<noscript\b[^>]*>.*?</noscript>",
                           re.DOTALL | re.IGNORECASE)
 _INS_RE = re.compile(r"<ins\b[^>]*>.*?</ins>", re.DOTALL | re.IGNORECASE)
-# Paragraphs whose textual content is obvious JavaScript rather than story
-# text. Cheap heuristic but it's been enough on the samples we've seen.
+# Paragraphs whose textual content is obvious JavaScript rather than
+# story text. The patterns demand actual JS syntax after the keyword so
+# we don't eat legitimate English paragraphs starting with "Let's go" or
+# "Window. The light poured in.".
 _JS_LINE_RE = re.compile(
-    r"^\s*(var\s|let\s|const\s|window\.|document\.|function\s|"
-    r"adx_id|pubadxtag|yaContextCb)",
+    r"^\s*("
+    r"var\s+[\w$]+\s*="      # var x =
+    r"|let\s+[\w$]+\s*="      # let x =
+    r"|const\s+[\w$]+\s*="    # const x =
+    r"|function\s+[\w$]+\s*\("   # function foo(
+    r"|window\.[\w$]+\s*[=.(\[]"  # window.foo = / .bar / (
+    r"|document\.[\w$]+\s*[=.(\[]"
+    r"|adx_id[\w$]*\b"        # ad-injector globals
+    r"|pubadxtag\b"
+    r"|yaContextCb\b"
+    r")",
     re.IGNORECASE,
 )
 _CHAPTER_NUM_HINT_RE = re.compile(r"chapter\s+(\d+)", re.IGNORECASE)
