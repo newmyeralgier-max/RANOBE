@@ -32,6 +32,23 @@ _ARTICLE_OPEN_RE = re.compile(
 )
 _DIV_TAG_RE = re.compile(r"<(/?)div\b[^>]*>", re.IGNORECASE)
 _ARTICLE_PARA_RE = re.compile(r"<p[^>]*>(.*?)</p>", re.DOTALL | re.IGNORECASE)
+
+# Strip out anything we definitely do NOT want in the translated body:
+# inline ad scripts, style blocks, noscript fallbacks, and ad-service
+# <ins>/<div class="adsb..."> placeholders ranobes sprinkles between
+# paragraphs.
+_SCRIPT_RE = re.compile(r"<script\b[^>]*>.*?</script>", re.DOTALL | re.IGNORECASE)
+_STYLE_RE = re.compile(r"<style\b[^>]*>.*?</style>", re.DOTALL | re.IGNORECASE)
+_NOSCRIPT_RE = re.compile(r"<noscript\b[^>]*>.*?</noscript>",
+                          re.DOTALL | re.IGNORECASE)
+_INS_RE = re.compile(r"<ins\b[^>]*>.*?</ins>", re.DOTALL | re.IGNORECASE)
+# Paragraphs whose textual content is obvious JavaScript rather than story
+# text. Cheap heuristic but it's been enough on the samples we've seen.
+_JS_LINE_RE = re.compile(
+    r"^\s*(var\s|let\s|const\s|window\.|document\.|function\s|"
+    r"adx_id|pubadxtag|yaContextCb)",
+    re.IGNORECASE,
+)
 _CHAPTER_NUM_HINT_RE = re.compile(r"chapter\s+(\d+)", re.IGNORECASE)
 
 
@@ -175,11 +192,15 @@ class RanobesAdapter(SiteAdapter):
             chapter.text = ""
             return chapter
 
+        block = _strip_ads(block)
         paragraphs = _ARTICLE_PARA_RE.findall(block)
         if paragraphs:
             parts = [normalize_text(strip_tags(p)) for p in paragraphs]
         else:
             parts = [normalize_text(strip_tags(block))]
+
+        # Drop paragraphs that are plainly leftover JS / ad snippets.
+        parts = [p for p in parts if p and not _JS_LINE_RE.match(p)]
 
         chapter.title = title.strip()
         chapter.text = normalize_text("\n\n".join(p for p in parts if p))
@@ -187,6 +208,15 @@ class RanobesAdapter(SiteAdapter):
 
 
 # ---- helpers -------------------------------------------------------------
+
+def _strip_ads(block: str) -> str:
+    """Remove script / style / noscript / ins blocks from an article chunk."""
+    block = _SCRIPT_RE.sub("", block)
+    block = _STYLE_RE.sub("", block)
+    block = _NOSCRIPT_RE.sub("", block)
+    block = _INS_RE.sub("", block)
+    return block
+
 
 def _extract_article_block(html: str) -> str | None:
     """Return the inner HTML of ``<div id="arrticle">`` with balanced ``<div>``.

@@ -311,6 +311,113 @@ def test_download_respects_cancel_event(tmp_path):
     raise AssertionError("expected DownloadCancelled")
 
 
+# ---- ranobes adapter: strip ad JS from chapter body -----------------------
+
+def test_ranobes_adapter_strips_ad_scripts(monkeypatch):
+    """Ranobes injects ``<script>`` ad blocks and, occasionally, paragraphs
+    whose content is pure JavaScript. None of that should survive into the
+    chapter .txt (otherwise the translator happily translates it)."""
+    from novel_dl.adapters import ranobes as mod
+
+    polluted_html = """
+    <html><body>
+    <h1 class="title">Chapter 7: Tainted</h1>
+    <div id="arrticle">
+      <p>Real paragraph one.</p>
+      <script>var leaky = 1;</script>
+      <p>var adx_id_10448 = document.getElementById('bg-ssp-10448');</p>
+      <p>window.pubadxtag.push({zoneid: 10448});</p>
+      <ins class="adsbygoogle"></ins>
+      <p>Real paragraph two.</p>
+    </div>
+    </body></html>
+    """
+
+    monkeypatch.setattr(mod, "fetch_html", lambda url, **kw: polluted_html)
+    adapter = mod.RanobesAdapter()
+    ch = Chapter(num=7, title="Chapter 7: Tainted", url="https://x/7", index=0)
+    filled = adapter.fetch_chapter(ch)
+    text = filled.text or ""
+    assert "Real paragraph one." in text
+    assert "Real paragraph two." in text
+    assert "adx_id" not in text
+    assert "pubadxtag" not in text
+    assert "var " not in text
+    assert "<script" not in text
+
+
+# ---- translator chunking & response parsing -------------------------------
+
+def test_translator_split_respects_paragraph_boundaries():
+    from novel_dl.translator import split_into_chunks
+
+    text = "\n\n".join(["para one " * 50, "para two " * 50, "para three " * 50])
+    chunks = split_into_chunks(text, max_chars=600)
+    # Each chunk must end on a paragraph boundary — i.e. splitting on \n\n
+    # inside a chunk should give exactly 1 or more complete paragraphs.
+    for c in chunks:
+        for p in c.split("\n\n"):
+            assert p.strip()
+    # All input paragraphs are accounted for in order.
+    joined = "\n\n".join(chunks)
+    assert joined.count("para one") == 50
+    assert joined.count("para three") == 50
+
+
+def test_translator_extract_v2_response_shape():
+    from novel_dl.translator import _extract_text_from_cohere
+
+    payload = {
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Привет!"}],
+        }
+    }
+    assert _extract_text_from_cohere(payload) == "Привет!"
+
+
+# ---- epub writer ----------------------------------------------------------
+
+def test_epub_builder_produces_valid_archive(tmp_path):
+    import zipfile
+
+    from novel_dl.epub import build_epub_from_folder
+
+    src = tmp_path / "chs"
+    src.mkdir()
+    (src / "chapter_0001_Prologue.txt").write_text(
+        "# Prologue\n\nFirst paragraph.\n\nSecond paragraph.\n",
+        encoding="utf-8",
+    )
+    (src / "chapter_0002_A Start.txt").write_text(
+        "# A Start\n\nOnce upon a time.\n",
+        encoding="utf-8",
+    )
+
+    out = tmp_path / "book.epub"
+    build_epub_from_folder(src, out, book_title="My Book", author="Тест")
+
+    with zipfile.ZipFile(out) as zf:
+        names = zf.namelist()
+        # mimetype must be first and uncompressed per EPUB spec.
+        assert names[0] == "mimetype"
+        info = zf.getinfo("mimetype")
+        assert info.compress_type == zipfile.ZIP_STORED
+        assert zf.read("mimetype") == b"application/epub+zip"
+        # Required files for a minimal EPUB 3.
+        assert "META-INF/container.xml" in names
+        assert "OEBPS/content.opf" in names
+        assert "OEBPS/nav.xhtml" in names
+        assert "OEBPS/ch0001.xhtml" in names
+        assert "OEBPS/ch0002.xhtml" in names
+        opf = zf.read("OEBPS/content.opf").decode("utf-8")
+        assert "My Book" in opf
+        assert "Тест" in opf
+        ch1 = zf.read("OEBPS/ch0001.xhtml").decode("utf-8")
+        assert "First paragraph." in ch1
+        assert "Second paragraph." in ch1
+
+
 if __name__ == "__main__":
     import pytest
 

@@ -26,8 +26,32 @@ from typing import Callable
 
 from .core import Book, UnsupportedSiteError
 from .downloader import DownloadCancelled, DownloadError, download_chapters
+from .epub import build_epub_from_folder
 from .registry import get_adapter
+from .translator import (
+    DEFAULT_COHERE_MODEL,
+    TranslationCancelled,
+    TranslationError,
+    TranslatorConfig,
+    translate_folder,
+)
 from .utils import FetchError, parse_range_spec, safe_filename
+
+DEFAULT_TRANSLATOR_PROMPT = (
+    "Ты — элитный литературный переводчик, специализирующийся на азиатских "
+    "веб-новеллах. Твоя задача — взять существующий английский перевод и "
+    "передать его на русском языке на уровне качества современной веб-новеллы, "
+    "написанной изначально по-русски — естественно, живо и атмосферно.\n\n"
+    "КРИТИЧЕСКИЕ ПРАВИЛА:\n"
+    "1. НИКОГДА не переводи дословно — перефразируй, сохраняя смысл.\n"
+    "2. НИКОГДА не переноси английский порядок слов, если режет слух.\n"
+    "3. НИКОГДА не добавляй сюжет или действия, которых нет в оригинале.\n"
+    "4. НИКОГДА не сокращай детали, описания, образы и нюансы.\n"
+    "5. ВСЕГДА сохраняй исходный смысл, структуру сцены и тон автора.\n\n"
+    "ОФОРМЛЕНИЕ: русские кавычки « », тире — для реплик, многоточие … для "
+    "незавершённых фраз. Имена собственные транслитерируй естественно.\n\n"
+    "ВЫВОДИ ТОЛЬКО ПЕРЕВЕДЁННЫЙ ОТРЫВОК — без комментариев и пояснений."
+)
 
 # ---- worker messages -----------------------------------------------------
 
@@ -45,6 +69,17 @@ class _BookReady:
 class _DownloadDone:
     out_dir: Path
     combined_path: Path | None
+
+
+@dataclass
+class _TranslateDone:
+    out_dir: Path
+    count: int
+
+
+@dataclass
+class _EpubDone:
+    epub_path: Path
 
 
 @dataclass
@@ -69,8 +104,8 @@ class NovelDownloaderApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Novel Downloader")
-        self.root.geometry("780x620")
-        self.root.minsize(640, 520)
+        self.root.geometry("900x820")
+        self.root.minsize(760, 640)
 
         self._messages: queue.Queue[object] = queue.Queue()
         self._worker: threading.Thread | None = None
@@ -152,6 +187,53 @@ class NovelDownloaderApp:
         self.open_btn = ttk.Button(action, text="Открыть папку с результатом",
                                    command=self._on_open_folder, state="disabled")
         self.open_btn.pack(side="left", padx=(8, 0))
+
+        tr = ttk.LabelFrame(self.root, text="5. Перевод (Cohere)")
+        tr.pack(fill="x", **pad)
+        key_row = ttk.Frame(tr)
+        key_row.pack(fill="x", padx=8, pady=(8, 2))
+        ttk.Label(key_row, text="API-ключ:").pack(side="left")
+        self.cohere_key_var = tk.StringVar()
+        self.cohere_key_entry = ttk.Entry(
+            key_row, textvariable=self.cohere_key_var, show="•",
+        )
+        self.cohere_key_entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
+        ttk.Label(key_row, text="Модель:").pack(side="left")
+        self.cohere_model_var = tk.StringVar(value=DEFAULT_COHERE_MODEL)
+        ttk.Entry(key_row, textvariable=self.cohere_model_var,
+                  width=22).pack(side="left", padx=(6, 0))
+
+        prompt_frame = ttk.Frame(tr)
+        prompt_frame.pack(fill="x", padx=8, pady=(4, 4))
+        ttk.Label(prompt_frame, text="Промпт (редактируемый):",
+                  anchor="w").pack(fill="x")
+        self.prompt_text = tk.Text(prompt_frame, height=8, wrap="word")
+        self.prompt_text.pack(side="left", fill="both", expand=True)
+        self.prompt_text.insert("1.0", DEFAULT_TRANSLATOR_PROMPT)
+        prompt_sb = ttk.Scrollbar(prompt_frame, orient="vertical",
+                                  command=self.prompt_text.yview)
+        prompt_sb.pack(side="right", fill="y")
+        self.prompt_text.configure(yscrollcommand=prompt_sb.set)
+
+        tr_btns = ttk.Frame(tr)
+        tr_btns.pack(fill="x", padx=8, pady=(2, 8))
+        self.translate_btn = ttk.Button(tr_btns, text="Перевести скачанные",
+                                        command=self._on_translate)
+        self.translate_btn.pack(side="left")
+        self.retranslate_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(tr_btns, text="Переводить заново (игнор кэша)",
+                        variable=self.retranslate_var).pack(
+            side="left", padx=(12, 0),
+        )
+        self.epub_btn = ttk.Button(tr_btns, text="Собрать EPUB",
+                                   command=self._on_build_epub)
+        self.epub_btn.pack(side="right")
+        self.epub_source_var = tk.StringVar(value="ru (перевод)")
+        ttk.Label(tr_btns, text="Источник:").pack(side="right", padx=(0, 4))
+        ttk.Combobox(
+            tr_btns, textvariable=self.epub_source_var, width=16,
+            values=["ru (перевод)", "en (оригинал)"], state="readonly",
+        ).pack(side="right", padx=(0, 4))
 
         self.progress = ttk.Progressbar(self.root, mode="determinate")
         self.progress.pack(fill="x", padx=10, pady=(0, 4))
@@ -253,7 +335,97 @@ class NovelDownloaderApp:
             self._cancel_event.set()
             self.stop_btn.config(state="disabled")
             self.status_var.set("Останавливаю...")
-            self._append_log("Запрошена остановка. Дожидаюсь текущей главы...")
+            self._append_log("Запрошена остановка. Дожидаюсь текущей задачи...")
+
+    # ---- translate / epub --------------------------------------------
+    def _src_dir_for_postprocess(self) -> Path | None:
+        """Where the raw English chapter_*.txt files live."""
+        if self._last_out_dir is not None and self._last_out_dir.exists():
+            return self._last_out_dir
+        # Fall back to computing it from the current book + output field.
+        if self._book is None:
+            return None
+        out_root = Path(self.output_var.get() or "downloads")
+        return out_root / safe_filename(self._book.slug or self._book.title)
+
+    def _on_translate(self) -> None:
+        src_dir = self._src_dir_for_postprocess()
+        if src_dir is None or not src_dir.exists():
+            messagebox.showwarning(
+                "Нечего переводить",
+                "Сначала скачай главы или укажи папку, где лежат chapter_*.txt.",
+            )
+            return
+
+        api_key = self.cohere_key_var.get().strip()
+        if not api_key:
+            messagebox.showwarning(
+                "Нет ключа Cohere",
+                "Вставь API-ключ Cohere. Получить: "
+                "https://dashboard.cohere.com/api-keys",
+            )
+            return
+        model = self.cohere_model_var.get().strip() or DEFAULT_COHERE_MODEL
+        prompt = self.prompt_text.get("1.0", "end").strip()
+        if not prompt:
+            messagebox.showwarning(
+                "Пустой промпт",
+                "В поле промпта должен быть текст. Сбрось на дефолтный, "
+                "если случайно удалил.",
+            )
+            return
+
+        dst_dir = src_dir.parent / (src_dir.name + "_ru")
+        cfg = TranslatorConfig(api_key=api_key, model=model, system_prompt=prompt)
+
+        files_count = sum(1 for _ in src_dir.glob("chapter_*.txt"))
+        if files_count == 0:
+            messagebox.showwarning(
+                "Нечего переводить",
+                f"В {src_dir} нет файлов chapter_*.txt.",
+            )
+            return
+
+        self._set_state_downloading()
+        self.progress.config(maximum=files_count, value=0)
+        self._append_log(
+            f"Перевод {files_count} глав → {dst_dir} (модель {model})"
+        )
+        force = self.retranslate_var.get()
+        self._cancel_event = threading.Event()
+        self._spawn(lambda: self._worker_translate(
+            src_dir, dst_dir, cfg, force, self._cancel_event,
+        ))
+
+    def _on_build_epub(self) -> None:
+        raw_dir = self._src_dir_for_postprocess()
+        if raw_dir is None or not raw_dir.exists():
+            messagebox.showwarning(
+                "Нечего собирать",
+                "Сначала скачай (и при желании переведи) главы.",
+            )
+            return
+        use_ru = self.epub_source_var.get().startswith("ru")
+        src_dir = raw_dir.parent / (raw_dir.name + "_ru") if use_ru else raw_dir
+        if not src_dir.exists() or not any(src_dir.glob("chapter_*.txt")):
+            missing = "переведённых" if use_ru else "скачанных"
+            messagebox.showwarning(
+                "Нет данных",
+                f"В папке {src_dir} нет {missing} глав. "
+                f"Сначала {'переведи' if use_ru else 'скачай'}.",
+            )
+            return
+        title = (self._book.title if self._book else raw_dir.name) or raw_dir.name
+        author = (self._book.author if self._book else "") or ""
+        if use_ru:
+            title = f"{title} (перевод)"
+        epub_path = raw_dir.parent / f"{safe_filename(title)}.epub"
+        self._set_state_downloading()
+        self.progress.config(maximum=1, value=0)
+        self._append_log(f"Собираю EPUB из {src_dir} → {epub_path}")
+        self._spawn(lambda: self._worker_build_epub(
+            src_dir, epub_path, title, author,
+        ))
 
     def _on_open_folder(self) -> None:
         if not self._last_out_dir or not self._last_out_dir.exists():
@@ -316,6 +488,55 @@ class NovelDownloaderApp:
             return
         self._messages.put(_DownloadDone(out_dir=out_dir, combined_path=combined))
 
+    def _worker_translate(self, src_dir: Path, dst_dir: Path,
+                           cfg: TranslatorConfig, force: bool,
+                           cancel_event: threading.Event) -> None:
+        counter = {"i": 0}
+        total = sum(1 for _ in src_dir.glob("chapter_*.txt"))
+
+        def progress(msg: str) -> None:
+            self._messages.put(_LogMsg(msg))
+            # Count only top-level "[i/N]" file transitions, not chunk logs.
+            if msg.lstrip().startswith("["):
+                counter["i"] += 1
+                self._messages.put(_ProgressMsg(counter["i"], total))
+
+        try:
+            done = translate_folder(
+                src_dir, dst_dir, cfg,
+                force=force, progress=progress, cancel_event=cancel_event,
+            )
+        except TranslationCancelled as exc:
+            self._messages.put(_Error(
+                str(exc),
+                downloaded=exc.translated,
+                last_ok=exc.last_ok,
+                cancelled=True,
+            ))
+            return
+        except TranslationError as exc:
+            self._messages.put(_Error(
+                str(exc),
+                downloaded=exc.translated,
+                last_ok=exc.last_ok,
+            ))
+            return
+        except Exception as exc:  # pragma: no cover
+            self._messages.put(_Error(f"Неожиданная ошибка перевода: {exc!r}"))
+            return
+        self._messages.put(_TranslateDone(out_dir=dst_dir, count=len(done)))
+
+    def _worker_build_epub(self, src_dir: Path, epub_path: Path,
+                            title: str, author: str) -> None:
+        try:
+            build_epub_from_folder(
+                src_dir, epub_path, book_title=title, author=author,
+            )
+        except Exception as exc:  # pragma: no cover
+            self._messages.put(_Error(f"Не удалось собрать EPUB: {exc}"))
+            return
+        self._messages.put(_EpubDone(epub_path=epub_path))
+
     # ---- pump ----------------------------------------------------------
     def _drain_messages(self) -> None:
         try:
@@ -355,6 +576,22 @@ class NovelDownloaderApp:
             self._set_state_ready()
             messagebox.showinfo("Готово",
                                 f"Скачано в:\n{msg.out_dir}")
+        elif isinstance(msg, _TranslateDone):
+            self.status_var.set("Перевод готов.")
+            self._append_log(f"Переведено {msg.count} глав в {msg.out_dir}")
+            self._set_state_ready()
+            messagebox.showinfo(
+                "Перевод готов",
+                f"Переведено {msg.count} глав.\n\n{msg.out_dir}",
+            )
+        elif isinstance(msg, _EpubDone):
+            self.status_var.set("EPUB готов.")
+            self._append_log(f"EPUB: {msg.epub_path}")
+            self._set_state_ready()
+            messagebox.showinfo(
+                "EPUB готов",
+                f"Книга собрана:\n{msg.epub_path}",
+            )
         elif isinstance(msg, _Error):
             last = (
                 f"Последняя успешно скачанная глава: #{msg.last_ok}."
