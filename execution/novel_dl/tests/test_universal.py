@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from pathlib import Path
 
 HERE = Path(__file__).resolve()
@@ -13,8 +14,12 @@ if str(EXECUTION_DIR) not in sys.path:
 
 from novel_dl.adapters.freewebnovel import FreeWebNovelAdapter  # noqa: E402
 from novel_dl.adapters.ranobes import RanobesAdapter  # noqa: E402
-from novel_dl.core import UnsupportedSiteError  # noqa: E402
-from novel_dl.downloader import download_chapters  # noqa: E402
+from novel_dl.core import Book, Chapter, SiteAdapter, UnsupportedSiteError  # noqa: E402
+from novel_dl.downloader import (  # noqa: E402
+    DownloadCancelled,
+    DownloadError,
+    download_chapters,
+)
 from novel_dl.registry import get_adapter  # noqa: E402
 from novel_dl.utils import normalize_text, parse_range_spec, strip_tags  # noqa: E402
 
@@ -210,6 +215,100 @@ def test_freewebnovel_adapter(monkeypatch, tmp_path):
     assert "Hello world." in (ch.text or "")
     # The duplicated title line at the start of the body is stripped.
     assert not (ch.text or "").lower().startswith("chapter 1: intro")
+
+
+# ---- downloader: fail-fast on empty body & cancellation -------------------
+
+class _StubAdapter(SiteAdapter):
+    """Minimal adapter for unit-testing download_chapters behaviour."""
+
+    site_id = "stub"
+
+    def __init__(self, bodies: dict[str, str]) -> None:
+        # Map of chapter URL -> body text the "adapter" will return.
+        self._bodies = bodies
+
+    @classmethod
+    def matches(cls, url: str) -> bool:  # pragma: no cover - unused
+        return False
+
+    def fetch_book(self, url: str) -> Book:  # pragma: no cover - unused
+        raise NotImplementedError
+
+    def fetch_chapter(self, chapter: Chapter) -> Chapter:
+        chapter.text = self._bodies.get(chapter.url, "")
+        return chapter
+
+
+def _stub_book() -> Book:
+    chapters = [
+        Chapter(num=i, title=f"Chapter {i}", url=f"https://x/{i}", index=i - 1)
+        for i in range(1, 6)
+    ]
+    return Book(
+        title="Stub Book", author="", slug="stub", source_url="https://x",
+        cover_url="", description="", chapters=chapters,
+    )
+
+
+def test_download_stops_on_empty_body_and_reports_progress(tmp_path):
+    """The old code silently wrote '# Chapter X\\n\\n\\n' for empty bodies.
+    We now fail fast with stats so the user sees how far we got."""
+    book = _stub_book()
+    # Chapters 1..3 have text, chapter 4 is empty, chapter 5 never runs.
+    adapter = _StubAdapter({
+        "https://x/1": "body one",
+        "https://x/2": "body two",
+        "https://x/3": "body three",
+        "https://x/4": "",
+    })
+
+    out_dir = tmp_path / "out"
+    try:
+        download_chapters(adapter, book, [1, 2, 3, 4, 5], out_dir, delay=0)
+    except DownloadError as exc:
+        assert not isinstance(exc, DownloadCancelled)
+        assert exc.downloaded == 3
+        assert exc.last_ok == 3
+        assert "Пустое тело" in str(exc)
+        # Only 1..3 made it to disk.
+        files = sorted(p.name for p in out_dir.glob("chapter_*.txt"))
+        assert len(files) == 3
+        for f in files:
+            body = (out_dir / f).read_text(encoding="utf-8")
+            # No empty bodies on disk.
+            assert "body" in body
+        return
+    raise AssertionError("expected DownloadError on empty chapter body")
+
+
+def test_download_respects_cancel_event(tmp_path):
+    """User-triggered Stop must interrupt the loop and surface stats."""
+    book = _stub_book()
+    adapter = _StubAdapter({f"https://x/{i}": f"body {i}" for i in range(1, 6)})
+
+    cancel = threading.Event()
+
+    captured: list[str] = []
+
+    def progress(msg: str) -> None:
+        captured.append(msg)
+        # Cancel after 2 successful fetches.
+        if msg.startswith("[2/5] fetching"):
+            cancel.set()
+
+    try:
+        download_chapters(
+            adapter, book, [1, 2, 3, 4, 5], tmp_path / "out",
+            delay=0, progress=progress, cancel_event=cancel,
+        )
+    except DownloadCancelled as exc:
+        # After progress("[2/5] fetching"), chapter 2 finishes, then the
+        # loop checks cancel at the top of iteration 3 -> stop.
+        assert exc.downloaded == 2
+        assert exc.last_ok == 2
+        return
+    raise AssertionError("expected DownloadCancelled")
 
 
 if __name__ == "__main__":

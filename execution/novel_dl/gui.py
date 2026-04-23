@@ -25,7 +25,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Callable
 
 from .core import Book, UnsupportedSiteError
-from .downloader import DownloadError, download_chapters
+from .downloader import DownloadCancelled, DownloadError, download_chapters
 from .registry import get_adapter
 from .utils import FetchError, parse_range_spec, safe_filename
 
@@ -50,6 +50,9 @@ class _DownloadDone:
 @dataclass
 class _Error:
     text: str
+    downloaded: int = 0
+    last_ok: int | None = None
+    cancelled: bool = False
 
 
 @dataclass
@@ -71,6 +74,7 @@ class NovelDownloaderApp:
 
         self._messages: queue.Queue[object] = queue.Queue()
         self._worker: threading.Thread | None = None
+        self._cancel_event: threading.Event | None = None
         self._book: Book | None = None
         self._adapter = None
         self._last_out_dir: Path | None = None
@@ -142,6 +146,9 @@ class NovelDownloaderApp:
         self.download_btn = ttk.Button(action, text="Скачать",
                                        command=self._on_download)
         self.download_btn.pack(side="left")
+        self.stop_btn = ttk.Button(action, text="Остановить",
+                                   command=self._on_stop, state="disabled")
+        self.stop_btn.pack(side="left", padx=(8, 0))
         self.open_btn = ttk.Button(action, text="Открыть папку с результатом",
                                    command=self._on_open_folder, state="disabled")
         self.open_btn.pack(side="left", padx=(8, 0))
@@ -165,19 +172,23 @@ class NovelDownloaderApp:
     def _set_state_idle(self) -> None:
         self.load_btn.config(state="normal")
         self.download_btn.config(state="disabled")
+        self.stop_btn.config(state="disabled")
 
     def _set_state_loading(self) -> None:
         self.load_btn.config(state="disabled")
         self.download_btn.config(state="disabled")
+        self.stop_btn.config(state="disabled")
         self.status_var.set("Загружаю список глав...")
 
     def _set_state_ready(self) -> None:
         self.load_btn.config(state="normal")
         self.download_btn.config(state="normal")
+        self.stop_btn.config(state="disabled")
 
     def _set_state_downloading(self) -> None:
         self.load_btn.config(state="disabled")
         self.download_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
         self.status_var.set("Скачиваю...")
 
     # ---- button handlers -----------------------------------------------
@@ -232,8 +243,17 @@ class NovelDownloaderApp:
         adapter = self._adapter
         book = self._book
         force = self.force_var.get()
+        self._cancel_event = threading.Event()
         self._spawn(lambda: self._worker_download(adapter, book, indices,
-                                                  out_dir, combined, force))
+                                                  out_dir, combined, force,
+                                                  self._cancel_event))
+
+    def _on_stop(self) -> None:
+        if self._cancel_event is not None and not self._cancel_event.is_set():
+            self._cancel_event.set()
+            self.stop_btn.config(state="disabled")
+            self.status_var.set("Останавливаю...")
+            self._append_log("Запрошена остановка. Дожидаюсь текущей главы...")
 
     def _on_open_folder(self) -> None:
         if not self._last_out_dir or not self._last_out_dir.exists():
@@ -258,7 +278,8 @@ class NovelDownloaderApp:
 
     def _worker_download(self, adapter, book: Book, indices: list[int],
                           out_dir: Path, combined: Path | None,
-                          force: bool) -> None:
+                          force: bool,
+                          cancel_event: threading.Event) -> None:
         counter = {"i": 0}
         total = len(indices)
 
@@ -273,9 +294,22 @@ class NovelDownloaderApp:
                 delay=0.5, force=force,
                 progress=progress,
                 combined_path=combined,
+                cancel_event=cancel_event,
             )
+        except DownloadCancelled as exc:
+            self._messages.put(_Error(
+                str(exc),
+                downloaded=exc.downloaded,
+                last_ok=exc.last_ok,
+                cancelled=True,
+            ))
+            return
         except DownloadError as exc:
-            self._messages.put(_Error(f"Ошибка скачивания: {exc}"))
+            self._messages.put(_Error(
+                str(exc),
+                downloaded=exc.downloaded,
+                last_ok=exc.last_ok,
+            ))
             return
         except Exception as exc:  # pragma: no cover
             self._messages.put(_Error(f"Неожиданная ошибка: {exc!r}"))
@@ -322,10 +356,33 @@ class NovelDownloaderApp:
             messagebox.showinfo("Готово",
                                 f"Скачано в:\n{msg.out_dir}")
         elif isinstance(msg, _Error):
-            self.status_var.set("Ошибка.")
-            self._append_log("ERROR: " + msg.text)
-            self._set_state_ready()
-            messagebox.showerror("Ошибка", msg.text)
+            last = (
+                f"Последняя успешно скачанная глава: #{msg.last_ok}."
+                if msg.last_ok is not None
+                else "Ни одной главы не скачано в этом запуске."
+            )
+            summary = f"Скачано за запуск: {msg.downloaded}. {last}"
+            if msg.cancelled:
+                self.status_var.set("Остановлено.")
+                self._append_log("СТОП: " + msg.text)
+                self._append_log(summary)
+                self._set_state_ready()
+                messagebox.showinfo(
+                    "Остановлено",
+                    f"{msg.text}\n\n{summary}\n\nЧастично скачанные главы "
+                    "остались в папке. При повторном запуске с тем же "
+                    "диапазоном они пропустятся.",
+                )
+            else:
+                self.status_var.set("Ошибка.")
+                self._append_log("ERROR: " + msg.text)
+                if msg.downloaded or msg.last_ok is not None:
+                    self._append_log(summary)
+                self._set_state_ready()
+                body = msg.text
+                if msg.downloaded or msg.last_ok is not None:
+                    body = f"{msg.text}\n\n{summary}"
+                messagebox.showerror("Ошибка", body)
 
     def _append_log(self, text: str) -> None:
         self.log.config(state="normal")
@@ -356,41 +413,36 @@ def _install_layout_agnostic_clipboard_bindings(root: tk.Misc) -> None:
     Tk's default clipboard shortcuts are bound to Latin keysyms
     (``<Control-v>`` etc.), so when the user has Russian (or any non-Latin)
     layout active, the events arrive as ``<Control-Cyrillic_em>`` and Tk
-    silently does nothing. We bind both the Latin keysyms and their
-    Cyrillic twins on the same physical keys to the standard virtual
-    clipboard events, at the ``TEntry`` / ``Entry`` / ``Text`` class level so
-    every text widget inherits the fix.
-    """
-    # Latin keysym -> (Cyrillic keysym on same physical key, virtual event).
-    mapping = {
-        "v": ("Cyrillic_em", "<<Paste>>"),
-        "c": ("Cyrillic_es", "<<Copy>>"),
-        "x": ("Cyrillic_che", "<<Cut>>"),
-        "a": ("Cyrillic_ef", "<<SelectAll>>"),
-    }
+    silently does nothing. The robust fix is to look at ``event.keycode``,
+    which is the physical key scan code and therefore layout-independent.
 
-    def make_handler(virtual_event: str):
-        def handler(event: "tk.Event") -> str:
-            event.widget.event_generate(virtual_event)
-            return "break"
-        return handler
+    We dispatch on **both** keysym (Latin + Cyrillic twins) and keycode
+    (Windows VK codes + X11 hardware codes for the row ``AVCX``) so the
+    binding works on Windows, Linux/X11 and macOS X11 alike.
+    """
+    # Physical keys → virtual clipboard event.
+    # Keys listed by keysym (layout-dependent text) and by keycode
+    # (layout-independent physical code). We accept a match on either.
+    specs = [
+        # virt event,     latin keysyms,       cyrillic keysyms,        win vk, x11 code
+        ("<<Paste>>",     {"v", "V"},          {"Cyrillic_em", "м", "М"},    86,   55),
+        ("<<Copy>>",      {"c", "C"},          {"Cyrillic_es", "с", "С"},    67,   54),
+        ("<<Cut>>",       {"x", "X"},          {"Cyrillic_che", "ч", "Ч"},   88,   53),
+        ("<<SelectAll>>", {"a", "A"},          {"Cyrillic_ef", "ф", "Ф"},    65,   38),
+    ]
+
+    def on_ctrl_keypress(event: "tk.Event") -> "str | None":
+        keysym = event.keysym or ""
+        keycode = getattr(event, "keycode", 0)
+        for virt, latin, cyr, win_vk, x11_code in specs:
+            if keysym in latin or keysym in cyr \
+                    or keycode == win_vk or keycode == x11_code:
+                event.widget.event_generate(virt)
+                return "break"
+        return None
 
     for widget_class in ("TEntry", "Entry", "Text"):
-        for latin, (cyr, virt) in mapping.items():
-            handler = make_handler(virt)
-            # Bind both cases of the Cyrillic key; Latin keysyms are already
-            # wired by Tk itself, but we re-bind them too so the <<SelectAll>>
-            # case (which Tk does NOT bind by default on Entry) works.
-            for seq in (
-                f"<Control-{latin}>",
-                f"<Control-{latin.upper()}>",
-                f"<Control-{cyr}>",
-            ):
-                try:
-                    root.bind_class(widget_class, seq, handler)
-                except tk.TclError:
-                    # Unknown keysym on this Tk build — harmless, skip it.
-                    pass
+        root.bind_class(widget_class, "<Control-KeyPress>", on_ctrl_keypress)
 
     # Tk doesn't ship a default <<SelectAll>> handler for ttk.Entry/Entry;
     # wire one that selects the whole content.

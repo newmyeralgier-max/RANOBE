@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -13,7 +14,24 @@ from .utils import FetchError, safe_filename
 
 
 class DownloadError(RuntimeError):
-    """Raised when a chapter cannot be downloaded after retries."""
+    """Raised when a chapter cannot be downloaded after retries.
+
+    Carries progress stats so callers (CLI / GUI) can report how far the
+    download got before giving up: ``downloaded`` counts chapters that
+    landed on disk in this run, ``last_ok`` is the 1-based index into the
+    book's chapter list of the last successfully saved chapter (or ``None``
+    if nothing was saved yet).
+    """
+
+    def __init__(self, msg: str, *, downloaded: int = 0,
+                 last_ok: int | None = None) -> None:
+        super().__init__(msg)
+        self.downloaded = downloaded
+        self.last_ok = last_ok
+
+
+class DownloadCancelled(DownloadError):  # noqa: N818 — "cancelled" reads better than "Error"
+    """Raised when the user asked to stop the download."""
 
 
 def download_chapters(
@@ -26,6 +44,7 @@ def download_chapters(
     force: bool = False,
     progress: Callable[[str], None] | None = None,
     combined_path: Path | None = None,
+    cancel_event: "threading.Event | None" = None,
 ) -> list[Chapter]:
     """Download the chapters at the given 1-based ``indices``.
 
@@ -34,6 +53,12 @@ def download_chapters(
     - Each file starts with the chapter title as a single Markdown H1 line,
       followed by a blank line and the paragraph-separated body. This format is
       optimised for pasting into local LLM translators.
+    - If the adapter returns an empty body or the network fetch errors out, we
+      **stop immediately** (``DownloadError``) instead of writing empty files.
+      The exception carries ``.downloaded`` and ``.last_ok`` so the caller can
+      tell the user how far we got.
+    - If ``cancel_event`` is supplied and set mid-loop, stop with
+      :class:`DownloadCancelled`.
     - After all chapters succeed, writes ``meta.json`` and optionally a single
       combined ``combined_path`` text file.
     """
@@ -41,8 +66,16 @@ def download_chapters(
     indices_list = list(indices)
     total = len(indices_list)
     results: list[Chapter] = []
+    last_ok_idx: int | None = None
 
     for i, idx in enumerate(indices_list, start=1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled(
+                f"Остановлено пользователем на {i}/{total}.",
+                downloaded=len(results),
+                last_ok=last_ok_idx,
+            )
+
         chapter = book.chapters[idx - 1]
         file_path = _chapter_file_path(out_dir, chapter)
         label = _chapter_label(chapter)
@@ -52,6 +85,7 @@ def download_chapters(
                 progress(f"[{i}/{total}] skip (exists): {label}")
             chapter.text = _read_body(file_path)
             results.append(chapter)
+            last_ok_idx = idx
             continue
 
         if progress:
@@ -59,13 +93,31 @@ def download_chapters(
         try:
             filled = adapter.fetch_chapter(chapter)
         except FetchError as exc:
-            raise DownloadError(f"Failed to fetch {chapter.url}: {exc}") from exc
+            raise DownloadError(
+                f"Сеть упала на главе {i}/{total} ({label}): {exc}",
+                downloaded=len(results),
+                last_ok=last_ok_idx,
+            ) from exc
+        except Exception as exc:  # pragma: no cover - adapter-specific
+            raise DownloadError(
+                f"Ошибка на главе {i}/{total} ({label}): {exc!r}",
+                downloaded=len(results),
+                last_ok=last_ok_idx,
+            ) from exc
 
-        if not filled.text:
-            if progress:
-                progress(f"    warning: empty body for {label}")
+        if not filled.text or not filled.text.strip():
+            # Don't write empty files — treat as a fatal error and stop.
+            raise DownloadError(
+                f"Пустое тело главы {i}/{total} ({label}). Сайт не вернул "
+                f"текст (возможно, Cloudflare или региональный фильтр). "
+                f"Стоп на главе {i}.",
+                downloaded=len(results),
+                last_ok=last_ok_idx,
+            )
+
         _write_chapter_file(file_path, filled)
         results.append(filled)
+        last_ok_idx = idx
         if delay > 0 and i < total:
             time.sleep(delay)
 
