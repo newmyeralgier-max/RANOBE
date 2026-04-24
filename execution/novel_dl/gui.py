@@ -106,8 +106,12 @@ class NovelDownloaderApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Novel Downloader")
-        self.root.geometry("900x820")
-        self.root.minsize(760, 640)
+        # Bigger default height so the Log panel + status line are visible
+        # without the user having to resize. On Windows with small 1366×768
+        # laptops 820 was enough to hide the log completely behind the
+        # translate controls.
+        self.root.geometry("960x980")
+        self.root.minsize(800, 720)
 
         self._messages: queue.Queue[object] = queue.Queue()
         self._worker: threading.Thread | None = None
@@ -115,6 +119,10 @@ class NovelDownloaderApp:
         self._book: Book | None = None
         self._adapter = None
         self._last_out_dir: Path | None = None
+        # Human-readable label for the currently running background op.
+        # Lets the status line say "Переведено 3/50" instead of the
+        # generic "Скачано N/M" regardless of which op is running.
+        self._operation_label: str = ""
 
         self._build_widgets()
         self._apply_settings(load_settings())
@@ -220,7 +228,10 @@ class NovelDownloaderApp:
         prompt_frame.pack(fill="x", padx=8, pady=(4, 4))
         ttk.Label(prompt_frame, text="Промпт (редактируемый):",
                   anchor="w").pack(fill="x")
-        self.prompt_text = tk.Text(prompt_frame, height=8, wrap="word")
+        # height=5 keeps the prompt editable but doesn't steal vertical
+        # space from the log panel below. Scrollable inside the widget
+        # if the prompt is longer.
+        self.prompt_text = tk.Text(prompt_frame, height=5, wrap="word")
         self.prompt_text.pack(side="left", fill="both", expand=True)
         self.prompt_text.insert("1.0", DEFAULT_TRANSLATOR_PROMPT)
         prompt_sb = ttk.Scrollbar(prompt_frame, orient="vertical",
@@ -289,16 +300,27 @@ class NovelDownloaderApp:
             text="напр. 3-200 или all",
         ).pack(side="left", padx=(6, 0))
 
+        # Pack bottom-up so progress + status + log always have guaranteed
+        # space at the bottom of the window, even when the translate panel
+        # above is expanded or the user has shrunk the window. Previously
+        # on 1366×768 laptops the log panel was pushed off-screen and the
+        # user couldn't see live translation progress.
+        log_frame = ttk.LabelFrame(self.root, text="Лог", height=180)
+        # pack_propagate(False) = don't shrink to fit children — respect
+        # the explicit height so the log never becomes 0px tall.
+        log_frame.pack_propagate(False)
         self.progress = ttk.Progressbar(self.root, mode="determinate")
-        self.progress.pack(fill="x", padx=10, pady=(0, 4))
         self.status_var = tk.StringVar(value="Готов.")
-        ttk.Label(self.root, textvariable=self.status_var, anchor="w").pack(
-            fill="x", padx=10,
+        self.status_label = ttk.Label(
+            self.root, textvariable=self.status_var, anchor="w",
+            wraplength=900, justify="left",
         )
+        # Order: progress (bottom), status (above progress), log (fills rest).
+        self.progress.pack(side="bottom", fill="x", padx=10, pady=(0, 4))
+        self.status_label.pack(side="bottom", fill="x", padx=10, pady=(0, 2))
+        log_frame.pack(side="bottom", fill="both", expand=True, **pad)
 
-        log_frame = ttk.LabelFrame(self.root, text="Лог")
-        log_frame.pack(fill="both", expand=True, **pad)
-        self.log = tk.Text(log_frame, height=10, wrap="word", state="disabled")
+        self.log = tk.Text(log_frame, wrap="word", state="disabled")
         self.log.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
         log_sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
         log_sb.pack(side="right", fill="y", pady=8, padx=(0, 8))
@@ -419,6 +441,7 @@ class NovelDownloaderApp:
         # enabled) and the assignment below would set a stale / missing
         # event that the worker never sees.
         self._cancel_event = threading.Event()
+        self._operation_label = "Скачано"
         self._set_state_downloading()
         self.progress.config(maximum=len(indices), value=0)
         self._append_log(
@@ -586,6 +609,7 @@ class NovelDownloaderApp:
         force = self.retranslate_var.get()
         # Create cancel event BEFORE flipping state — see _on_download.
         self._cancel_event = threading.Event()
+        self._operation_label = "Переведено"
         self._set_state_downloading()
         files_count = len(wanted)
         self.progress.config(maximum=files_count, value=0)
@@ -653,6 +677,7 @@ class NovelDownloaderApp:
         # meaningful point to cancel it, so we null out the cancel event
         # and force the Stop button off after the usual state transition.
         self._cancel_event = None
+        self._operation_label = "Собрано EPUB"
         self._set_state_downloading()
         self.stop_btn.config(state="disabled")
         self.status_var.set("Собираю EPUB...")
@@ -797,9 +822,16 @@ class NovelDownloaderApp:
     def _handle_message(self, msg: object) -> None:
         if isinstance(msg, _LogMsg):
             self._append_log(msg.text)
+            # Mirror the latest log line into the status label so the user
+            # sees live activity even when the Лог panel is clipped by a
+            # small window or hidden behind a scrollbar. Trim to one line.
+            single = msg.text.splitlines()[0] if msg.text else ""
+            if single:
+                self.status_var.set(single[:300])
         elif isinstance(msg, _ProgressMsg):
             self.progress.config(value=msg.current, maximum=msg.total)
-            self.status_var.set(f"Скачано {msg.current}/{msg.total}")
+            label = self._operation_label or "Прогресс"
+            self.status_var.set(f"{label}: {msg.current}/{msg.total}")
         elif isinstance(msg, _BookReady):
             self._book = msg.book
             total = len(msg.book.chapters)

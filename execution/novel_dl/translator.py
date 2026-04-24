@@ -297,8 +297,31 @@ def translate_text(
                 )
             if attempt < cfg.retries:
                 time.sleep(cfg.retry_backoff * attempt)
+    # Exhausted retries without ever reaching Cohere successfully.
+    # Distinguish pure network failure (can't even open TCP / HTTPS) from
+    # server-side errors — on Windows + split-tunnel VPN, urllib often
+    # can't reach api.cohere.com even when the browser can. That looks
+    # identical to "server is down" unless we say it out loud.
+    reason = str(last_err) if last_err is not None else "нет подробностей"
+    is_network = isinstance(
+        last_err, (urllib.error.URLError, TimeoutError, ConnectionError)
+    )
+    if is_network:
+        raise TranslationError(
+            f"Не удалось достучаться до Cohere за {cfg.retries} попыток "
+            f"({reason}).\n\n"
+            "Проверь в PowerShell:\n"
+            "    python -c \"import urllib.request; "
+            "print(urllib.request.urlopen('https://api.cohere.com/', "
+            "timeout=10).status)\"\n"
+            "Если команда зависает или пишет timeout/URLError — это "
+            "значит твой VPN пропускает только браузер (split-tunnel), "
+            "а Python идёт напрямую и его режет провайдер. Решение: "
+            "переключи VPN в режим «весь трафик» (Full tunnel) и "
+            "перезапусти окно. Уже переведённые главы пропустятся."
+        )
     raise TranslationError(
-        f"Cohere request failed after {cfg.retries} attempts: {last_err}"
+        f"Cohere request failed after {cfg.retries} attempts: {reason}"
     )
 
 
