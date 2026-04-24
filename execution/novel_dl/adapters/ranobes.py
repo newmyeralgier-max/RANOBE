@@ -62,6 +62,22 @@ _JS_LINE_RE = re.compile(
 )
 _CHAPTER_NUM_HINT_RE = re.compile(r"chapter\s+(\d+)", re.IGNORECASE)
 
+# Heuristics for "this page is a Cloudflare challenge, not a chapter".
+_CHALLENGE_MARKERS = (
+    "just a moment",
+    "cf-browser-verification",
+    "cloudflare",
+    "attention required",
+    "turnstile",
+    "challenge-platform",
+    "checking your browser",
+)
+
+
+def _looks_like_challenge(html: str) -> bool:
+    low = html.lower()
+    return any(m in low for m in _CHALLENGE_MARKERS)
+
 
 @register_adapter
 class RanobesAdapter(SiteAdapter):
@@ -195,26 +211,59 @@ class RanobesAdapter(SiteAdapter):
 
     # ---- chapter ---------------------------------------------------------
     def fetch_chapter(self, chapter: Chapter) -> Chapter:
-        html = fetch_html(chapter.url)
-        title = chapter.title or _extract_chapter_title(html) or "Untitled"
+        """Fetch a single chapter, retrying with long backoff on Cloudflare.
 
-        block = _extract_article_block(html)
-        if block is None:
-            chapter.text = ""
+        Ranobes intermittently serves an anti-bot / challenge page after
+        ~50 rapid requests from the same IP. The page returns HTTP 200
+        but has no ``<div id="arrticle">``. We used to take that as
+        "empty chapter" and abort the whole run; now we sleep 30/60/120 s
+        between attempts and try up to 3 times. The downloader treats a
+        subsequent empty body as fatal, so if we still can't get through
+        after the retries, the user gets a clear "Cloudflare — wait and
+        retry" error rather than a silent stop mid-book.
+        """
+        sleeps = (30, 60, 120)
+        last_html = ""
+        for attempt, wait in enumerate((0, *sleeps), start=1):
+            if wait:
+                time.sleep(wait)
+            last_html = fetch_html(chapter.url)
+            block = _extract_article_block(last_html)
+            if block is None:
+                continue
+
+            title = chapter.title or _extract_chapter_title(last_html) or "Untitled"
+            block = _strip_ads(block)
+            paragraphs = _ARTICLE_PARA_RE.findall(block)
+            if paragraphs:
+                parts = [normalize_text(strip_tags(p)) for p in paragraphs]
+            else:
+                parts = [normalize_text(strip_tags(block))]
+
+            # Drop paragraphs that are plainly leftover JS / ad snippets.
+            parts = [p for p in parts if p and not _JS_LINE_RE.match(p)]
+            body = normalize_text("\n\n".join(p for p in parts if p))
+            if not body.strip():
+                # Parsed the article block but ended up with nothing —
+                # treat like a challenge page and retry.
+                continue
+
+            chapter.title = title.strip()
+            chapter.text = body
             return chapter
 
-        block = _strip_ads(block)
-        paragraphs = _ARTICLE_PARA_RE.findall(block)
-        if paragraphs:
-            parts = [normalize_text(strip_tags(p)) for p in paragraphs]
-        else:
-            parts = [normalize_text(strip_tags(block))]
-
-        # Drop paragraphs that are plainly leftover JS / ad snippets.
-        parts = [p for p in parts if p and not _JS_LINE_RE.match(p)]
-
-        chapter.title = title.strip()
-        chapter.text = normalize_text("\n\n".join(p for p in parts if p))
+        # All attempts returned a challenge / empty article. Surface it
+        # as a FetchError so the downloader can show the user an
+        # actionable message instead of silently writing an empty file.
+        if _looks_like_challenge(last_html):
+            raise FetchError(
+                "Ranobes включил антибот-защиту (Cloudflare). "
+                f"За 3 попытки с паузами не удалось получить текст главы "
+                f"({chapter.url}). Открой ссылку в браузере один раз, "
+                "подожди 10-15 минут, и запусти скачку снова — уже "
+                "скачанные главы пропустятся."
+            )
+        chapter.text = ""
         return chapter
 
 

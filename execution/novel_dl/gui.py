@@ -643,7 +643,7 @@ class NovelDownloaderApp:
         try:
             download_chapters(
                 adapter, book, indices, out_dir,
-                delay=0.5, force=force,
+                delay=1.5, force=force,
                 progress=progress,
                 combined_path=combined,
                 cancel_event=cancel_event,

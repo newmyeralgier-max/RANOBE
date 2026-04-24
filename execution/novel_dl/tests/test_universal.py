@@ -782,6 +782,88 @@ def test_epub_uses_current_modified_timestamp(tmp_path):
     assert year >= 2024, f"modified year must be current, got {year}"
 
 
+def test_cohere_403_cloudflare_message_is_actionable():
+    """HTTP 403 from Cohere's edge must produce a message that tells the
+    user it's a geo-block, not a key/prompt issue, and that a VPN fixes
+    it. The raw Cloudflare HTML is useless by itself."""
+    from novel_dl.translator import _format_cohere_4xx
+
+    raw = (
+        "HTTP 403: <html><head><title>403 Forbidden</title></head>"
+        "<body><h1>Error: Forbidden</h1>"
+        "<h2>Your client does not have permission to get URL "
+        "<code>/v2/chat</code> from this server.</h2></body></html>"
+    )
+    msg = _format_cohere_4xx(403, raw)
+    assert "VPN" in msg
+    assert "гео" in msg.lower() or "регион" in msg.lower()
+    # Must NOT just dump the raw HTML back at the user.
+    assert "<html" not in msg.lower()
+
+
+def test_cohere_401_and_404_are_specific():
+    from novel_dl.translator import _format_cohere_4xx
+
+    m401 = _format_cohere_4xx(401, "HTTP 401: invalid token")
+    assert "401" in m401 and "ключ" in m401.lower()
+    m404 = _format_cohere_4xx(404, "HTTP 404: model not found")
+    assert "404" in m404 and "модел" in m404.lower()
+
+
+def test_ranobes_retries_challenge_then_succeeds(monkeypatch):
+    """If ranobes serves a Cloudflare page on attempt 1 but the real
+    article on attempt 2, we must return the article (after a sleep)
+    instead of giving up."""
+    from novel_dl.adapters import ranobes as mod
+
+    call_htmls = [
+        "<html><body>Just a moment...</body></html>",
+        RANOBES_CHAPTER_HTML,
+    ]
+    calls = {"i": 0}
+
+    def fake_fetch(url, **kwargs):  # noqa: ARG001
+        html = call_htmls[min(calls["i"], len(call_htmls) - 1)]
+        calls["i"] += 1
+        return html
+
+    monkeypatch.setattr(mod, "fetch_html", fake_fetch)
+    # Don't actually sleep 30s in a unit test.
+    monkeypatch.setattr(mod.time, "sleep", lambda *_a, **_k: None)
+
+    adapter = RanobesAdapter()
+    ch = Chapter(num=1, title="Chapter 1: Alpha",
+                 url="https://ranobes.net/slug-42/100.html")
+    got = adapter.fetch_chapter(ch)
+    assert got.text and "First paragraph." in got.text
+    assert calls["i"] == 2
+
+
+def test_ranobes_raises_challenge_error_after_all_retries_fail(monkeypatch):
+    """If every retry still returns a challenge page, raise FetchError
+    with a message that says Cloudflare, not the old generic empty-body
+    stop."""
+    from novel_dl.adapters import ranobes as mod
+    from novel_dl.utils import FetchError
+
+    def fake_fetch(url, **kwargs):  # noqa: ARG001
+        return "<html><body>Just a moment... cloudflare challenge</body></html>"
+
+    monkeypatch.setattr(mod, "fetch_html", fake_fetch)
+    monkeypatch.setattr(mod.time, "sleep", lambda *_a, **_k: None)
+
+    adapter = RanobesAdapter()
+    ch = Chapter(num=5, title="Chapter 5",
+                 url="https://ranobes.net/slug-42/500.html")
+    try:
+        adapter.fetch_chapter(ch)
+    except FetchError as exc:
+        text = str(exc).lower()
+        assert "cloudflare" in text or "антибот" in text
+        return
+    raise AssertionError("expected FetchError after exhausted retries")
+
+
 if __name__ == "__main__":
     import pytest
 

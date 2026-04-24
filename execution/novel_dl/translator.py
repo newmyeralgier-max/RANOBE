@@ -117,6 +117,50 @@ def _looks_runaway(text: str) -> bool:
     return False
 
 
+def _format_cohere_4xx(code: int, raw_msg: str) -> str:
+    """Turn a Cohere 4xx error into a user-actionable message.
+
+    The flavour users hit most often is HTTP 403 from api.cohere.com's
+    edge (Cloudflare), not Cohere's application layer. The edge refuses
+    connections from a handful of regions (Russia, Iran, China, etc.)
+    and the body is an HTML page saying "Your client does not have
+    permission". No API key change can fix that — only a VPN exit in an
+    allowed region.
+    """
+    low = raw_msg.lower()
+    if code == 403 and (
+        "does not have permission" in low
+        or "cloudflare" in low
+        or "<html" in low
+    ):
+        return (
+            "Cohere закрыл доступ с твоего IP (HTTP 403, блок на стороне "
+            "Cloudflare у api.cohere.com).\n\n"
+            "Это не ключ и не промпт — Cohere гео-блокирует ряд регионов "
+            "(Россия, Иран, Китай и др.).\n\n"
+            "Решение: включи VPN (любой узел US/EU/Израиль), перезапусти "
+            "окно, нажми «Перевести» ещё раз — уже переведённые главы "
+            "пропустятся."
+        )
+    if code == 401:
+        return (
+            "Cohere не принял ключ (HTTP 401). Проверь, что скопировал "
+            "ключ целиком (без пробелов) с https://dashboard.cohere.com/api-keys "
+            "и что он ещё активен."
+        )
+    if code == 402:
+        return (
+            "Cohere отклонил запрос: закончился кредит/лимит (HTTP 402). "
+            "Проверь баланс на dashboard.cohere.com."
+        )
+    if code == 404:
+        return (
+            "Cohere не знает такой модели (HTTP 404). Проверь, что имя "
+            "модели в поле «Модель» верное (например, command-a-03-2025)."
+        )
+    return f"Cohere отклонил запрос: {raw_msg}"
+
+
 def _finish_reason_is_length(payload: dict) -> bool:
     """Cohere v2 uses finish_reason ``"MAX_TOKENS"`` / ``"LENGTH"`` when
     the output was truncated. Tolerate either spelling.
@@ -218,9 +262,7 @@ def translate_text(text: str, cfg: TranslatorConfig) -> str:
             last_err = TranslationError(msg)
             # 4xx (except 408/429) is not worth retrying.
             if exc.code in (401, 402, 403, 404, 422):
-                raise TranslationError(
-                    f"Cohere отклонил запрос: {msg}"
-                ) from exc
+                raise TranslationError(_format_cohere_4xx(exc.code, msg)) from exc
             if attempt < cfg.retries:
                 time.sleep(cfg.retry_backoff * attempt)
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:

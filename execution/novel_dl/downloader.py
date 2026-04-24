@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 from dataclasses import asdict
@@ -119,7 +120,11 @@ def download_chapters(
         results.append(filled)
         last_ok_idx = idx
         if delay > 0 and i < total:
-            time.sleep(delay)
+            # Jitter ±30% so we don't look like a metronome to the site's
+            # rate-limiter — the fixed-interval pattern is what typically
+            # triggers ranobes' anti-bot after ~50 fast requests.
+            jitter = delay * 0.3
+            time.sleep(max(0.0, delay + random.uniform(-jitter, jitter)))
 
     _write_meta(out_dir, book, results)
     if combined_path is not None:
