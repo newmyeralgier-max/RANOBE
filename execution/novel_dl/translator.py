@@ -117,6 +117,22 @@ def _looks_runaway(text: str) -> bool:
     return False
 
 
+def _finish_reason_is_length(payload: dict) -> bool:
+    """Cohere v2 uses finish_reason ``"MAX_TOKENS"`` / ``"LENGTH"`` when
+    the output was truncated. Tolerate either spelling.
+    """
+    fr = payload.get("finish_reason")
+    if isinstance(fr, str) and fr.upper() in {"MAX_TOKENS", "LENGTH"}:
+        return True
+    # Some shapes nest it under message.
+    msg = payload.get("message")
+    if isinstance(msg, dict):
+        fr2 = msg.get("finish_reason")
+        if isinstance(fr2, str) and fr2.upper() in {"MAX_TOKENS", "LENGTH"}:
+            return True
+    return False
+
+
 def _too_long_vs_source(translated: str, source: str) -> bool:
     """Translated Russian is typically ~1.3–2.1× the English source.
     If we come back with >3.5× the source length it's almost always
@@ -162,6 +178,17 @@ def translate_text(text: str, cfg: TranslatorConfig) -> str:
                 raw = resp.read()
             payload = json.loads(raw.decode("utf-8", errors="replace"))
             translated = _extract_text_from_cohere(payload)
+            # Cohere signals 'hit max output tokens' via finish_reason.
+            # In that case the reply is truncated mid-chapter — retry
+            # from scratch, usually the next attempt finishes cleanly.
+            if _finish_reason_is_length(payload):
+                last_err = TranslationError(
+                    "Cohere обрезал перевод по лимиту токенов (finish_reason=LENGTH)."
+                )
+                if attempt < cfg.retries:
+                    time.sleep(cfg.retry_backoff * attempt)
+                    continue
+                raise last_err
             if _looks_runaway(translated):
                 last_err = TranslationError(
                     "Модель зациклилась на повторах (скрим-петля)."
@@ -206,8 +233,18 @@ def translate_text(text: str, cfg: TranslatorConfig) -> str:
 
 
 def _extract_text_from_cohere(payload: dict) -> str:
-    """Pull assistant text out of a v2 /chat response."""
-    msg = payload.get("message") or {}
+    """Pull assistant text out of a v2 /chat response.
+
+    Cohere error payloads sometimes put the error message in ``message``
+    as a plain string (``{"message": "invalid api token"}``) instead of
+    the usual ``{"message": {"content": [...]}}``. In that case calling
+    ``.get`` on a ``str`` would blow up with AttributeError; we handle it
+    explicitly and raise a clean TranslationError instead.
+    """
+    raw_msg = payload.get("message")
+    if isinstance(raw_msg, str):
+        raise TranslationError(f"Cohere вернул ошибку: {raw_msg}")
+    msg = raw_msg if isinstance(raw_msg, dict) else {}
     parts = msg.get("content") or []
     if isinstance(parts, list):
         out: list[str] = []
@@ -215,7 +252,10 @@ def _extract_text_from_cohere(payload: dict) -> str:
             if isinstance(part, dict) and part.get("type") == "text":
                 out.append(part.get("text") or "")
         if out:
-            return "\n".join(p for p in out if p).strip()
+            # Join with a blank line so paragraph structure survives
+            # multi-part responses (Cohere sometimes splits a long reply
+            # into several text parts).
+            return "\n\n".join(p for p in out if p).strip()
     # Fallback for single-string responses (older/other shapes).
     if isinstance(parts, str):
         return parts.strip()

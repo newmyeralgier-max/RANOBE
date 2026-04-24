@@ -667,6 +667,121 @@ def test_parse_chapter_number_spec_basic():
     assert _parse_chapter_number_spec("3-abc", available) is None
 
 
+# ---- audit-round bug fixes ----------------------------------------------
+
+def test_parse_range_spec_tolerates_garbage():
+    """Garbage input must not crash \u2014 callers treat [] as 'nothing
+    selected'. Before this fix, ``int('abc')`` bubbled up as an uncaught
+    ValueError into the Tk worker thread and the GUI silently stopped.
+    """
+    assert parse_range_spec("abc", 10) == []
+    assert parse_range_spec("3-xyz", 10) == []
+    # A mix of good + bad parts keeps the good ones.
+    assert parse_range_spec("1-3,abc,5", 10) == [1, 2, 3, 5]
+    assert parse_range_spec("1-3,5-foo,8", 10) == [1, 2, 3, 8]
+
+
+def test_extract_text_handles_string_error_payload():
+    """Cohere error payloads ship ``message`` as a string; the extractor
+    used to AttributeError on that. Must raise a clean TranslationError.
+    """
+    from novel_dl.translator import TranslationError, _extract_text_from_cohere
+
+    try:
+        _extract_text_from_cohere({"message": "invalid api token"})
+    except TranslationError as exc:
+        assert "invalid api token" in str(exc)
+        return
+    raise AssertionError("expected TranslationError on string message")
+
+
+def test_extract_text_joins_multi_part_with_blank_line():
+    """Multi-part responses must preserve paragraph structure."""
+    from novel_dl.translator import _extract_text_from_cohere
+
+    payload = {"message": {"content": [
+        {"type": "text", "text": "First paragraph."},
+        {"type": "text", "text": "Second paragraph."},
+    ]}}
+    got = _extract_text_from_cohere(payload)
+    assert got == "First paragraph.\n\nSecond paragraph."
+
+
+def test_translator_retries_on_finish_reason_length(monkeypatch):
+    """A LENGTH / MAX_TOKENS finish reason means Cohere truncated us \u2014
+    retry instead of shipping a half-chapter translation.
+    """
+    from novel_dl import translator as mod
+
+    calls = {"n": 0}
+
+    class FakeResp:
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def read(self) -> bytes:
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a) -> None:
+            pass
+
+    def fake_urlopen(req, timeout):  # noqa: ARG001
+        calls["n"] += 1
+        import json as _j
+        if calls["n"] == 1:
+            body = _j.dumps({
+                "message": {"content": [{"type": "text", "text": "Частичный пе"}]},
+                "finish_reason": "LENGTH",
+            })
+        else:
+            body = _j.dumps({
+                "message": {"content": [{"type": "text", "text": "Полный перевод."}]},
+                "finish_reason": "COMPLETE",
+            })
+        return FakeResp(body.encode("utf-8"))
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(mod.time, "sleep", lambda *_a, **_k: None)
+
+    cfg = mod.TranslatorConfig(
+        api_key="x", model="m", system_prompt="p", retries=3, retry_backoff=0.0,
+    )
+    got = mod.translate_text("A block to translate.", cfg)
+    assert got == "Полный перевод."
+    assert calls["n"] == 2
+
+
+def test_epub_uses_current_modified_timestamp(tmp_path):
+    """dcterms:modified must be a real UTC timestamp, not the 1970 epoch
+    placeholder that used to ship. eReaders reject suspicious dates.
+    """
+    import re as _re
+    import zipfile
+
+    from novel_dl.epub import build_epub_from_folder
+
+    src = tmp_path / "chs"
+    src.mkdir()
+    (src / "chapter_0001_t.txt").write_text(
+        "# Title\n\nBody.\n", encoding="utf-8",
+    )
+    out = tmp_path / "out.epub"
+    build_epub_from_folder(src, out, book_title="T")
+    with zipfile.ZipFile(out) as zf:
+        opf = zf.read("OEBPS/content.opf").decode("utf-8")
+    m = _re.search(
+        r'<meta property="dcterms:modified">'
+        r'(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}Z</meta>',
+        opf,
+    )
+    assert m, f"dcterms:modified not found or malformed: {opf[:500]}"
+    year = int(m.group(1))
+    assert year >= 2024, f"modified year must be current, got {year}"
+
+
 if __name__ == "__main__":
     import pytest
 

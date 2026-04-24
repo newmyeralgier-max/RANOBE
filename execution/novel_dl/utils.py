@@ -107,17 +107,23 @@ def parse_range_spec(spec: str, total: int) -> list[int]:
         part = raw_part.strip()
         if not part:
             continue
-        if "-" in part:
-            lo_s, hi_s = part.split("-", 1)
-            lo = int(lo_s) if lo_s.strip() else 1
-            hi = int(hi_s) if hi_s.strip() else total
-            if lo > hi:
-                lo, hi = hi, lo
-            lo = max(1, lo)
-            hi = min(total, hi)
-            out.update(range(lo, hi + 1))
-        else:
-            idx = int(part)
-            if 1 <= idx <= total:
-                out.add(idx)
+        try:
+            if "-" in part:
+                lo_s, hi_s = part.split("-", 1)
+                lo = int(lo_s) if lo_s.strip() else 1
+                hi = int(hi_s) if hi_s.strip() else total
+                if lo > hi:
+                    lo, hi = hi, lo
+                lo = max(1, lo)
+                hi = min(total, hi)
+                out.update(range(lo, hi + 1))
+            else:
+                idx = int(part)
+                if 1 <= idx <= total:
+                    out.add(idx)
+        except ValueError:
+            # Unparseable part (e.g. "abc" or "3-xyz"): skip it instead
+            # of crashing the caller. Callers already treat an empty
+            # result as "nothing selected" and surface a warning.
+            continue
     return sorted(out)

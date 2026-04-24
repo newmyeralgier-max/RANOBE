@@ -8,6 +8,7 @@ tested and that is enough for the "send it to my e-reader" use case.
 
 from __future__ import annotations
 
+import datetime as _dt
 import html
 import re
 import uuid
@@ -65,6 +66,13 @@ def _nav_xhtml(chapters: list[tuple[str, str]]) -> str:
     )
 
 
+def _now_utc_iso() -> str:
+    """Current UTC time as an EPUB-compliant ``dcterms:modified`` string."""
+    now = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0)
+    # Drop tzinfo and append explicit 'Z' — matches the reader-accepted form.
+    return now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _content_opf(book_title: str, author: str, book_id: str,
                  chapters: list[tuple[str, str]]) -> str:
     manifest_items = [
@@ -89,7 +97,7 @@ def _content_opf(book_title: str, author: str, book_id: str,
         f'    <dc:title>{_xml_escape(book_title)}</dc:title>\n'
         f'    <dc:creator>{_xml_escape(author or "Unknown")}</dc:creator>\n'
         '    <dc:language>ru</dc:language>\n'
-        '    <meta property="dcterms:modified">1970-01-01T00:00:00Z</meta>\n'
+        f'    <meta property="dcterms:modified">{_now_utc_iso()}</meta>\n'
         '  </metadata>\n'
         '  <manifest>\n'
         + "\n".join(manifest_items) + "\n"
