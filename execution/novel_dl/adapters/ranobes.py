@@ -91,11 +91,13 @@ class RanobesAdapter(SiteAdapter):
         return any(host == d or host.endswith("." + d) for d in _DOMAINS)
 
     # ---- book ------------------------------------------------------------
-    def fetch_book(self, url: str) -> Book:
+    def fetch_book(self, url: str, *, cancel_event=None) -> Book:
         parsed = urllib.parse.urlparse(url)
         base = f"{parsed.scheme}://{parsed.netloc}"
 
         book_id, book_page_url = self._resolve_book_id(url, base)
+        if cancel_event is not None and cancel_event.is_set():
+            raise FetchError("Отменено пользователем.")
         html = fetch_html(book_page_url)
         meta = _extract_meta(html)
 
@@ -105,7 +107,7 @@ class RanobesAdapter(SiteAdapter):
         description = meta.get("og:description", "") or meta.get("description", "")
         slug = _slug_from_book_url(book_page_url) or f"novel-{book_id}"
 
-        chapters = self._list_chapters(base, book_id)
+        chapters = self._list_chapters(base, book_id, cancel_event=cancel_event)
         return Book(
             title=title.strip(),
             author=author.strip(),
@@ -133,7 +135,9 @@ class RanobesAdapter(SiteAdapter):
             "Expected /novels/<id>-<slug>.html or a chapter URL."
         )
 
-    def _list_chapters(self, base: str, book_id: str) -> list[Chapter]:
+    def _list_chapters(
+        self, base: str, book_id: str, *, cancel_event=None,
+    ) -> list[Chapter]:
         chapters: list[Chapter] = []
         seen_ids: set[str] = set()
         page = 1
@@ -141,6 +145,11 @@ class RanobesAdapter(SiteAdapter):
         referer = f"{base}/chapters/{book_id}/"
 
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise FetchError(
+                    f"Отменено пользователем на странице {page} "
+                    f"списка глав. Скачано частично: {len(chapters)} шт."
+                )
             list_url = f"{base}/chapters/{book_id}/page/{page}/"
             # Pass Referer so ranobes' anti-bot / CDN is less likely to serve
             # us a challenge page that lacks window.__DATA__.

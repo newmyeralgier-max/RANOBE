@@ -189,13 +189,22 @@ def _too_long_vs_source(translated: str, source: str) -> bool:
 
 # ---- translation primitives ----------------------------------------------
 
-def translate_text(text: str, cfg: TranslatorConfig) -> str:
+def translate_text(
+    text: str, cfg: TranslatorConfig,
+    *, progress: Callable[[str], None] | None = None,
+) -> str:
     """Translate a single block of text with one Cohere request.
 
     Retries on network failure AND on pathological output (scream
     repetition loops, or output far longer than the source). The retry
     nudges temperature up slightly — at 0.1 the model sometimes locks
     into a bad loop it can't break out of.
+
+    ``progress`` is called with short status strings before each HTTP
+    attempt and after each response. When this function is called from
+    the GUI the caller threads those strings straight into the log so
+    the user sees "sending 6000 chars…" / "got 8200 chars" / "retry 2
+    (temp=0.2)" instead of a minute of silence.
     """
     if not text.strip():
         return ""
@@ -207,6 +216,12 @@ def translate_text(text: str, cfg: TranslatorConfig) -> str:
     last_err: Exception | None = None
     for attempt in range(1, cfg.retries + 1):
         temp = cfg.temperature + 0.1 * (attempt - 1)
+        if progress:
+            progress(
+                f"    → Cohere: отправляю {len(text)} символов "
+                f"(попытка {attempt}/{cfg.retries}, temp={temp:.1f})"
+            )
+        t_start = time.monotonic()
         body = {
             "model": cfg.model,
             "messages": [
@@ -222,6 +237,12 @@ def translate_text(text: str, cfg: TranslatorConfig) -> str:
                 raw = resp.read()
             payload = json.loads(raw.decode("utf-8", errors="replace"))
             translated = _extract_text_from_cohere(payload)
+            if progress:
+                elapsed = time.monotonic() - t_start
+                progress(
+                    f"    ← ответ: {len(translated)} символов "
+                    f"за {elapsed:.1f} сек"
+                )
             # Cohere signals 'hit max output tokens' via finish_reason.
             # In that case the reply is truncated mid-chapter — retry
             # from scratch, usually the next attempt finishes cleanly.
@@ -263,10 +284,17 @@ def translate_text(text: str, cfg: TranslatorConfig) -> str:
             # 4xx (except 408/429) is not worth retrying.
             if exc.code in (401, 402, 403, 404, 422):
                 raise TranslationError(_format_cohere_4xx(exc.code, msg)) from exc
+            if progress:
+                progress(f"    ✗ HTTP {exc.code} — ретрай через {cfg.retry_backoff * attempt:.0f} сек")
             if attempt < cfg.retries:
                 time.sleep(cfg.retry_backoff * attempt)
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
             last_err = exc
+            if progress:
+                progress(
+                    f"    ✗ сеть: {type(exc).__name__} ({exc}) — "
+                    f"ретрай через {cfg.retry_backoff * attempt:.0f} сек"
+                )
             if attempt < cfg.retries:
                 time.sleep(cfg.retry_backoff * attempt)
     raise TranslationError(
@@ -356,7 +384,9 @@ def translate_chapter_file(
     if cancel_event is not None and cancel_event.is_set():
         raise TranslationCancelled("Отменено до начала главы.")
 
-    translated_title = translate_text(title, cfg) if title else ""
+    translated_title = (
+        translate_text(title, cfg, progress=progress) if title else ""
+    )
     chunks = split_into_chunks(body, cfg.chunk_chars)
     translated_parts: list[str] = []
     for i, chunk in enumerate(chunks, start=1):
@@ -365,8 +395,10 @@ def translate_chapter_file(
                 f"Отменено на чанке {i}/{len(chunks)} файла {src.name}."
             )
         if progress:
-            progress(f"    chunk {i}/{len(chunks)} ({len(chunk)} chars)")
-        translated_parts.append(translate_text(chunk, cfg))
+            progress(
+                f"  чанк {i}/{len(chunks)} ({len(chunk)} символов)"
+            )
+        translated_parts.append(translate_text(chunk, cfg, progress=progress))
 
     translated_body = "\n\n".join(p for p in translated_parts if p).strip()
     if source_had_text and not translated_body:

@@ -28,6 +28,7 @@ DEFAULTS: dict[str, object] = {
     "save_api_key": False,
     "model": "command-a-03-2025",
     "prompt": "",
+    "translate_src_dir": "",
     "translate_range": "all",
     "retranslate": False,
     "epub_range": "all",

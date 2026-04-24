@@ -228,6 +228,23 @@ class NovelDownloaderApp:
         prompt_sb.pack(side="right", fill="y")
         self.prompt_text.configure(yscrollcommand=prompt_sb.set)
 
+        src_row = ttk.Frame(tr)
+        src_row.pack(fill="x", padx=8, pady=(0, 2))
+        ttk.Label(
+            src_row, text="Папка с английскими главами:",
+        ).pack(side="left")
+        self.translate_src_var = tk.StringVar(value="")
+        ttk.Entry(
+            src_row, textvariable=self.translate_src_var,
+        ).pack(side="left", fill="x", expand=True, padx=(6, 6))
+        ttk.Button(
+            src_row, text="Выбрать...", command=self._on_pick_translate_src,
+        ).pack(side="left")
+        ttk.Label(
+            tr, foreground="#555",
+            text="(пусто = папка последней скачки; иначе указываем вручную)",
+        ).pack(fill="x", padx=8)
+
         tr_range_row = ttk.Frame(tr)
         tr_range_row.pack(fill="x", padx=8, pady=(0, 2))
         ttk.Label(tr_range_row, text="Переводить главы:").pack(side="left")
@@ -298,7 +315,9 @@ class NovelDownloaderApp:
     def _set_state_loading(self) -> None:
         self.load_btn.config(state="disabled")
         self.download_btn.config(state="disabled")
-        self.stop_btn.config(state="disabled")
+        # Allow cancelling the chapter-list fetch — long books paginate
+        # and the user shouldn't have to wait for every page to finish.
+        self.stop_btn.config(state="normal")
         self.translate_btn.config(state="disabled")
         self.epub_btn.config(state="disabled")
         self.status_var.set("Загружаю список глав...")
@@ -339,15 +358,37 @@ class NovelDownloaderApp:
         self._book = None
         self.book_title_var.set("— загружаю... —")
         self.book_info_var.set("")
+        # Create the cancel event BEFORE flipping UI state so that a
+        # user who clicks Stop the instant the button becomes active
+        # can't race ahead of the event's creation.
+        self._cancel_event = threading.Event()
         self._set_state_loading()
         self._append_log(f"[site={self._adapter.site_id}] загружаю {url}")
         self._save_current_settings()
-        self._spawn(lambda: self._worker_fetch_book(url))
+        cancel_event = self._cancel_event
+        self._spawn(lambda: self._worker_fetch_book(url, cancel_event))
 
     def _on_pick_dir(self) -> None:
         chosen = filedialog.askdirectory(initialdir=self.output_var.get() or str(Path.cwd()))
         if chosen:
             self.output_var.set(chosen)
+
+    def _on_pick_translate_src(self) -> None:
+        """Let the user pick an existing folder of chapter_*.txt files.
+
+        Useful when the previous download happened in an earlier run and
+        ``_last_out_dir`` is no longer set, or when the user has an
+        external folder from elsewhere.
+        """
+        start = (
+            self.translate_src_var.get()
+            or (str(self._last_out_dir) if self._last_out_dir else "")
+            or self.output_var.get()
+            or str(Path.cwd())
+        )
+        chosen = filedialog.askdirectory(initialdir=start)
+        if chosen:
+            self.translate_src_var.set(chosen)
 
     def _on_download(self) -> None:
         if not self._book or not self._adapter:
@@ -408,6 +449,7 @@ class NovelDownloaderApp:
             "save_api_key": bool(self.save_api_key_var.get()),
             "model": self.cohere_model_var.get(),
             "prompt": self.prompt_text.get("1.0", "end").rstrip("\n"),
+            "translate_src_dir": self.translate_src_var.get(),
             "translate_range": self.translate_range_var.get(),
             "retranslate": bool(self.retranslate_var.get()),
             "epub_range": self.epub_range_var.get(),
@@ -440,6 +482,8 @@ class NovelDownloaderApp:
         if prompt:
             self.prompt_text.delete("1.0", "end")
             self.prompt_text.insert("1.0", prompt)
+        if _s("translate_src_dir"):
+            self.translate_src_var.set(_s("translate_src_dir"))
         if _s("translate_range"):
             self.translate_range_var.set(_s("translate_range"))
         self.retranslate_var.set(_b("retranslate", False))
@@ -460,10 +504,24 @@ class NovelDownloaderApp:
 
     # ---- translate / epub --------------------------------------------
     def _src_dir_for_postprocess(self) -> Path | None:
-        """Where the raw English chapter_*.txt files live."""
+        """Where the raw English chapter_*.txt files live.
+
+        Precedence:
+          1. The explicit "Папка с английскими главами" field, if the
+             user has typed / picked something. This is what lets the
+             user translate / build EPUB from chapters downloaded in a
+             previous run without having to click "Скачать" again.
+          2. The folder the most recent in-session download produced.
+          3. A path computed from the current book + output-root field.
+        """
+        explicit = self.translate_src_var.get().strip()
+        if explicit:
+            p = Path(explicit)
+            if p.exists():
+                return p
+            # Fall through — maybe the book-derived fallback exists.
         if self._last_out_dir is not None and self._last_out_dir.exists():
             return self._last_out_dir
-        # Fall back to computing it from the current book + output field.
         if self._book is None:
             return None
         out_root = Path(self.output_var.get() or "downloads")
@@ -617,11 +675,16 @@ class NovelDownloaderApp:
         self._worker = threading.Thread(target=target, daemon=True)
         self._worker.start()
 
-    def _worker_fetch_book(self, url: str) -> None:
+    def _worker_fetch_book(
+        self, url: str, cancel_event: threading.Event,
+    ) -> None:
         try:
-            book = self._adapter.fetch_book(url)
+            book = self._adapter.fetch_book(url, cancel_event=cancel_event)
         except FetchError as exc:
-            self._messages.put(_Error(f"Ошибка загрузки книги: {exc}"))
+            self._messages.put(_Error(
+                f"Ошибка загрузки книги: {exc}",
+                cancelled=cancel_event.is_set(),
+            ))
             return
         except Exception as exc:  # pragma: no cover - defensive
             self._messages.put(_Error(f"Неожиданная ошибка: {exc!r}"))

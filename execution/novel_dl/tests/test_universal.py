@@ -410,7 +410,7 @@ def test_translator_refuses_to_write_empty_translation(tmp_path, monkeypatch):
 
     # Stub out the network. Title translates, body translates to "" (silent
     # refusal) — this is the scenario we need to catch.
-    def fake_translate(text, cfg):
+    def fake_translate(text, cfg, *, progress=None):
         return "Заголовок" if text.strip() == "Title" else ""
 
     monkeypatch.setattr(mod, "translate_text", fake_translate)
@@ -587,7 +587,10 @@ def test_translator_range_filter(tmp_path, monkeypatch):
             f"# T{n}\n\nBody {n}.\n", encoding="utf-8",
         )
     dst = tmp_path / "ru"
-    monkeypatch.setattr(mod, "translate_text", lambda text, cfg: f"<<{text[:10]}>>")
+    monkeypatch.setattr(
+        mod, "translate_text",
+        lambda text, cfg, *, progress=None: f"<<{text[:10]}>>",
+    )
     cfg = mod.TranslatorConfig(api_key="x", model="m", system_prompt="p")
     got = mod.translate_folder(src, dst, cfg, wanted_numbers={2})
     assert len(got) == 1
@@ -862,6 +865,151 @@ def test_ranobes_raises_challenge_error_after_all_retries_fail(monkeypatch):
         assert "cloudflare" in text or "антибот" in text
         return
     raise AssertionError("expected FetchError after exhausted retries")
+
+
+# ---- new-behaviour regressions ------------------------------------------
+
+def test_translate_text_calls_progress_before_and_after_request(monkeypatch):
+    """User must see per-request progress (sent / received char counts)."""
+    from novel_dl import translator as mod
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "message": {
+                    "content": [{"type": "text", "text": "переведено."}],
+                },
+                "finish_reason": "COMPLETE",
+            }).encode("utf-8")
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen",
+                        lambda req, timeout=0: FakeResponse())
+
+    logs: list[str] = []
+    cfg = mod.TranslatorConfig(
+        api_key="x", model="m", system_prompt="p",
+        retries=1, retry_backoff=0.0,
+    )
+    out = mod.translate_text("Hello there.", cfg, progress=logs.append)
+
+    assert out == "переведено."
+    # At least one "→ sending" line and one "← response" line.
+    assert any("→ Cohere" in s and "символов" in s for s in logs), logs
+    assert any("← ответ" in s and "символов" in s for s in logs), logs
+
+
+def test_translate_text_logs_network_retry(monkeypatch):
+    """Network errors during translate must surface in the progress log."""
+    from novel_dl import translator as mod
+
+    calls = {"n": 0}
+
+    def flaky_urlopen(req, timeout=0):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("simulated timeout")
+
+        class R:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "message": {"content": [{"type": "text", "text": "ok."}]},
+                }).encode("utf-8")
+
+        return R()
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", flaky_urlopen)
+    logs: list[str] = []
+    cfg = mod.TranslatorConfig(
+        api_key="x", model="m", system_prompt="p",
+        retries=2, retry_backoff=0.0,
+    )
+    out = mod.translate_text("Some body.", cfg, progress=logs.append)
+
+    assert out == "ok."
+    assert any("✗ сеть" in s for s in logs), logs
+    assert any("ретрай" in s for s in logs), logs
+
+
+def test_ranobes_fetch_book_respects_cancel_event(monkeypatch):
+    """Stop button during list-fetch must abort between pagination pages."""
+    from novel_dl.adapters import ranobes as mod
+
+    # Minimal book page HTML so resolve_book_id + meta succeed.
+    book_html = (
+        '<html><head>'
+        '<meta property="og:title" content="Test">'
+        '<meta property="og:novel:author" content="A">'
+        '</head><body></body></html>'
+    )
+    # A page of the chapter list that WOULD continue to page 2.
+    page_html = (
+        '<html><head></head><body>'
+        '<script>window.__DATA__ = ' + json.dumps({
+            "pages_count": 5,
+            "chapters": [
+                {"id": 1, "title": "Ch 1", "link": "/x/1.html"},
+            ],
+        }) + ';</script></body></html>'
+    )
+
+    urls_fetched: list[str] = []
+    cancel = threading.Event()
+
+    def fake_fetch_html(url, **kwargs):
+        urls_fetched.append(url)
+        # Arm the cancel as soon as we've served the book page + page 1.
+        # The adapter checks cancel_event between pages and should bail
+        # before fetching page 2.
+        if "/page/1/" in url:
+            cancel.set()
+            return page_html
+        if "/chapters/" in url:
+            return page_html
+        return book_html
+
+    monkeypatch.setattr(mod, "fetch_html", fake_fetch_html)
+
+    adapter = mod.RanobesAdapter()
+    from novel_dl.utils import FetchError
+    try:
+        adapter.fetch_book(
+            "https://ranobes.top/novels/9999-test.html",
+            cancel_event=cancel,
+        )
+    except FetchError as exc:
+        assert "тменено" in str(exc) or "Отменено" in str(exc)
+    else:
+        raise AssertionError("expected FetchError on cancel")
+
+    assert not any("/page/2/" in u for u in urls_fetched), (
+        "adapter kept fetching pages after cancel was set"
+    )
+
+
+def test_settings_round_trip_translate_src_dir(tmp_path, monkeypatch):
+    """translate_src_dir must survive save→load."""
+    from novel_dl import settings as mod
+
+    monkeypatch.setattr(mod, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(mod, "CONFIG_PATH", tmp_path / "config.json")
+
+    payload = dict(mod.DEFAULTS)
+    payload["translate_src_dir"] = "/some/custom/path"
+    mod.save_settings(payload)
+    loaded = mod.load_settings()
+    assert loaded["translate_src_dir"] == "/some/custom/path"
 
 
 if __name__ == "__main__":

@@ -36,7 +36,9 @@ class FreeWebNovelAdapter(SiteAdapter):
         host = urllib.parse.urlparse(url).netloc.lower()
         return any(host == d or host.endswith("." + d) for d in _DOMAINS)
 
-    def fetch_book(self, url: str) -> Book:
+    def fetch_book(self, url: str, *, cancel_event=None) -> Book:
+        if cancel_event is not None and cancel_event.is_set():
+            raise FetchError("Отменено пользователем.")
         parsed = urllib.parse.urlparse(url)
         base = f"{parsed.scheme}://{parsed.netloc}"
         html = fetch_html(url, headers={"Referer": base + "/"})

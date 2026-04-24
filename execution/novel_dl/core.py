@@ -44,6 +44,12 @@ class SiteAdapter:
     Subclasses must implement :meth:`matches`, :meth:`fetch_book` and
     :meth:`fetch_chapter`. ``site_id`` is a short slug used for output paths
     and logging.
+
+    ``cancel_event`` is an optional :class:`threading.Event`; when set,
+    long-running adapters (e.g. paginated chapter-list fetches) must stop
+    at the next safe boundary and raise :class:`FetchError`. This lets
+    the GUI's Stop button interrupt a slow book load without waiting for
+    every pagination page to finish.
     """
 
     site_id: str = "generic"
@@ -52,7 +58,9 @@ class SiteAdapter:
     def matches(cls, url: str) -> bool:  # pragma: no cover - abstract
         raise NotImplementedError
 
-    def fetch_book(self, url: str) -> Book:  # pragma: no cover - abstract
+    def fetch_book(
+        self, url: str, *, cancel_event=None,
+    ) -> Book:  # pragma: no cover - abstract
         raise NotImplementedError
 
     def fetch_chapter(self, chapter: Chapter) -> Chapter:  # pragma: no cover - abstract
