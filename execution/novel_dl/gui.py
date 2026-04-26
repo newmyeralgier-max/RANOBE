@@ -225,6 +225,12 @@ class NovelDownloaderApp:
 
         top = ttk.LabelFrame(self.root, text="1. Ссылка на книгу")
         top.pack(fill="x", **pad)
+        # Stable anchor for repacking the update banner above the rest of
+        # the UI. ``winfo_children()[0]`` was the banner ITSELF (it's the
+        # first child created), so before=children[0] meant before=self,
+        # which Tk silently no-ops — banner ended up packed at the
+        # bottom of the side=top stack instead of the top.
+        self._first_real_widget = top
         self.url_var = tk.StringVar()
         # Combobox = Entry + dropdown of last 5 URLs the user has loaded.
         # ``state="normal"`` keeps it editable; the dropdown is just a
@@ -783,6 +789,7 @@ class NovelDownloaderApp:
             "recent_api_keys": list(self._recent_api_keys),
             "dark_mode": bool(self.dark_mode_var.get()),
             "use_prior_context": bool(self.use_context_var.get()),
+            "bilingual_epub": bool(self.bilingual_var.get()),
         }
 
     def _apply_settings(self, s: dict[str, object]) -> None:
@@ -846,6 +853,7 @@ class NovelDownloaderApp:
         self.dark_mode_var.set(_b("dark_mode", False))
         self._apply_theme(self.dark_mode_var.get())
         self.use_context_var.set(_b("use_prior_context", True))
+        self.bilingual_var.set(_b("bilingual_epub", False))
 
     def _save_current_settings(self) -> None:
         try:
@@ -870,6 +878,9 @@ class NovelDownloaderApp:
             self.translate_src_var, self.translate_range_var,
             self.retranslate_var,
             self.epub_source_var, self.epub_range_var,
+            # Phase 3.2 / 3.4: persist the toggles so users don't have
+            # to re-tick them on every launch.
+            self.use_context_var, self.bilingual_var,
         )
         for var in traced_vars:
             try:
@@ -1265,9 +1276,12 @@ class NovelDownloaderApp:
 
         def progress_with_chapter_count(msg: str) -> None:
             stripped = msg.lstrip()
-            if stripped.startswith("[") and (
-                "translating" in stripped or "skip" in stripped
-            ):
+            # Only count NEWLY translated chapters here. Cached/skipped
+            # chapters were already pre-credited into
+            # ``counter['chapters']`` from ``chapters_pre_done`` in the
+            # initial scan, so incrementing on "skip" lines double-counts
+            # and the bar overshoots the chapter total at the end.
+            if stripped.startswith("[") and "translating" in stripped:
                 counter["chapters"] += 1
             original_progress(msg)
 
@@ -1502,7 +1516,7 @@ class NovelDownloaderApp:
             )
             self._update_btn.config(state="normal")
             self._update_banner.pack(
-                fill="x", side="top", before=self.root.winfo_children()[0],
+                fill="x", side="top", before=self._first_real_widget,
             )
             self._append_log(
                 f"Update check: behind by {status.behind} commit(s) on "
