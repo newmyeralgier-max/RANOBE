@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from .core import Book, Chapter, SiteAdapter
-from .utils import FetchError, safe_filename
+from .utils import FetchError, safe_filename, wait_if_paused
 
 
 class DownloadError(RuntimeError):
@@ -46,6 +46,7 @@ def download_chapters(
     progress: Callable[[str], None] | None = None,
     combined_path: Path | None = None,
     cancel_event: "threading.Event | None" = None,
+    pause_event: "threading.Event | None" = None,
 ) -> list[Chapter]:
     """Download the chapters at the given 1-based ``indices``.
 
@@ -70,6 +71,11 @@ def download_chapters(
     last_ok_idx: int | None = None
 
     for i, idx in enumerate(indices_list, start=1):
+        # Pause first so a user clicking Pause mid-loop doesn't have to
+        # wait for the next chapter to be queued before the worker actually
+        # stops. Cancel is checked again right after the pause returns —
+        # a Stop click during a pause should still take effect.
+        wait_if_paused(pause_event, cancel_event)
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelled(
                 f"Остановлено пользователем на {i}/{total}.",

@@ -1,9 +1,16 @@
-"""Tests for Phase 1 foundation: settings recents, runlog, backup."""
+"""Tests for Phase 1 foundation: settings recents, runlog, backup.
+
+Phase 2 sanity checks live here too where they're tiny enough not to
+deserve their own file (e.g. wait_if_paused). Heavier Phase 2 work
+gets its own file when it grows.
+"""
 
 from __future__ import annotations
 
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve()
@@ -15,6 +22,7 @@ from novel_dl import settings as settings_mod  # noqa: E402
 from novel_dl.backup import snapshot_dir  # noqa: E402
 from novel_dl.runlog import RunLog, prune_old_logs  # noqa: E402
 from novel_dl.settings import push_recent  # noqa: E402
+from novel_dl.utils import wait_if_paused  # noqa: E402
 
 # ---- settings.push_recent -----------------------------------------------
 
@@ -147,6 +155,48 @@ def test_snapshot_creates_backup_with_chapters(tmp_path):
 
 def test_snapshot_returns_none_for_empty_dir(tmp_path):
     assert snapshot_dir(tmp_path, label="test") is None
+
+
+def test_wait_if_paused_returns_immediately_when_unpaused():
+    ev = threading.Event()
+    ev.set()
+    t = time.monotonic()
+    wait_if_paused(ev)
+    assert time.monotonic() - t < 0.05
+
+
+def test_wait_if_paused_blocks_until_set():
+    ev = threading.Event()  # cleared = paused
+
+    released = threading.Event()
+
+    def releaser():
+        time.sleep(0.1)
+        ev.set()
+        released.set()
+
+    threading.Thread(target=releaser, daemon=True).start()
+    t = time.monotonic()
+    wait_if_paused(ev, poll_interval=0.02)
+    elapsed = time.monotonic() - t
+    assert released.is_set()
+    assert 0.05 < elapsed < 1.0  # actually waited, but not forever
+
+
+def test_wait_if_paused_returns_on_cancel_even_when_still_paused():
+    pause = threading.Event()  # cleared = paused, never set
+    cancel = threading.Event()
+
+    def cancel_after():
+        time.sleep(0.05)
+        cancel.set()
+
+    threading.Thread(target=cancel_after, daemon=True).start()
+    t = time.monotonic()
+    wait_if_paused(pause, cancel, poll_interval=0.02)
+    elapsed = time.monotonic() - t
+    assert cancel.is_set()
+    assert elapsed < 1.0
 
 
 def test_snapshot_prunes_excess_backups(tmp_path):

@@ -118,6 +118,12 @@ class NovelDownloaderApp:
         self._messages: queue.Queue[object] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._cancel_event: threading.Event | None = None
+        # Pause is implemented as a single long-lived Event: set = run,
+        # clear = pause. Always lives so worker code can pass it to the
+        # downloader/translator unconditionally; .set() at construction
+        # so a fresh worker isn't paused by default.
+        self._pause_event: threading.Event = threading.Event()
+        self._pause_event.set()
         self._book: Book | None = None
         self._adapter = None
         self._last_out_dir: Path | None = None
@@ -157,7 +163,14 @@ class NovelDownloaderApp:
         top = ttk.LabelFrame(self.root, text="1. Ссылка на книгу")
         top.pack(fill="x", **pad)
         self.url_var = tk.StringVar()
-        ttk.Entry(top, textvariable=self.url_var).pack(
+        # Combobox = Entry + dropdown of last 5 URLs the user has loaded.
+        # ``state="normal"`` keeps it editable; the dropdown is just a
+        # convenience over freeform typing. ``height`` clamps the popup to
+        # MAX_RECENT entries so it doesn't sprawl.
+        self._url_combo = ttk.Combobox(
+            top, textvariable=self.url_var, height=5,
+        )
+        self._url_combo.pack(
             side="left", fill="x", expand=True, padx=(8, 6), pady=8,
         )
         self.load_btn = ttk.Button(top, text="Загрузить список глав",
@@ -212,6 +225,14 @@ class NovelDownloaderApp:
         self.download_btn = ttk.Button(action, text="Скачать",
                                        command=self._on_download)
         self.download_btn.pack(side="left")
+        # Pause toggles between "Пауза" and "Продолжить" depending
+        # on _pause_event state. Disabled until a worker is actually
+        # running (same lifecycle as Stop).
+        self.pause_btn = ttk.Button(
+            action, text="Пауза",
+            command=self._on_pause, state="disabled",
+        )
+        self.pause_btn.pack(side="left", padx=(8, 0))
         self.stop_btn = ttk.Button(action, text="Остановить",
                                    command=self._on_stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(8, 0))
@@ -225,10 +246,16 @@ class NovelDownloaderApp:
         key_row.pack(fill="x", padx=8, pady=(8, 2))
         ttk.Label(key_row, text="API-ключ:").pack(side="left")
         self.cohere_key_var = tk.StringVar()
-        self.cohere_key_entry = ttk.Entry(
-            key_row, textvariable=self.cohere_key_var, show="•",
+        # Combobox so the user can pick a previously-used key from the
+        # dropdown. ``show="•"`` masks the typed/picked value the same
+        # way the old plain Entry did. We keep a reference under the
+        # legacy attribute name so the rest of the code (state toggling,
+        # _push_recent_key) doesn't need to change.
+        self._key_combo = ttk.Combobox(
+            key_row, textvariable=self.cohere_key_var, show="•", height=5,
         )
-        self.cohere_key_entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
+        self._key_combo.pack(side="left", fill="x", expand=True, padx=(6, 6))
+        self.cohere_key_entry = self._key_combo
         ttk.Label(key_row, text="Модель:").pack(side="left")
         self.cohere_model_var = tk.StringVar(value=DEFAULT_COHERE_MODEL)
         ttk.Entry(key_row, textvariable=self.cohere_model_var,
@@ -367,8 +394,12 @@ class NovelDownloaderApp:
         self.load_btn.config(state="normal")
         self.download_btn.config(state="disabled")
         self.stop_btn.config(state="disabled")
+        self.pause_btn.config(state="disabled", text="Пауза")
         self.translate_btn.config(state="normal")
         self.epub_btn.config(state="normal")
+        # Reset the pause event whenever we transition to idle so the
+        # next operation starts in the "running" state.
+        self._pause_event.set()
 
     def _set_state_loading(self) -> None:
         self.load_btn.config(state="disabled")
@@ -376,6 +407,7 @@ class NovelDownloaderApp:
         # Allow cancelling the chapter-list fetch — long books paginate
         # and the user shouldn't have to wait for every page to finish.
         self.stop_btn.config(state="normal")
+        self.pause_btn.config(state="disabled", text="Пауза")
         self.translate_btn.config(state="disabled")
         self.epub_btn.config(state="disabled")
         self.status_var.set("Загружаю список глав...")
@@ -384,13 +416,16 @@ class NovelDownloaderApp:
         self.load_btn.config(state="normal")
         self.download_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
+        self.pause_btn.config(state="disabled", text="Пауза")
         self.translate_btn.config(state="normal")
         self.epub_btn.config(state="normal")
+        self._pause_event.set()
 
     def _set_state_downloading(self) -> None:
         self.load_btn.config(state="disabled")
         self.download_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
+        self.pause_btn.config(state="normal", text="Пауза")
         self.translate_btn.config(state="disabled")
         self.epub_btn.config(state="disabled")
         self.status_var.set("Работаю...")
@@ -496,9 +531,36 @@ class NovelDownloaderApp:
     def _on_stop(self) -> None:
         if self._cancel_event is not None and not self._cancel_event.is_set():
             self._cancel_event.set()
+            # If we were paused, resume the event so the worker wakes up
+            # and observes the cancel flag instead of staying parked.
+            self._pause_event.set()
             self.stop_btn.config(state="disabled")
+            self.pause_btn.config(state="disabled")
             self.status_var.set("Останавливаю...")
             self._append_log("Запрошена остановка. Дожидаюсь текущей задачи...")
+
+    def _on_pause(self) -> None:
+        """Toggle the worker's pause state.
+
+        Because pause is cooperative — the worker only blocks at safe
+        checkpoints — a click here may take a few seconds to visibly
+        "land". The status line is updated immediately so the user gets
+        feedback even before the worker observes the change.
+        """
+        if self._pause_event.is_set():
+            # Currently running → pause.
+            self._pause_event.clear()
+            self.pause_btn.config(text="Продолжить")
+            self._append_log(
+                "Пауза. Работа приостановлена на ближайшем безопасном шаге."
+            )
+            self.status_var.set("На паузе.")
+        else:
+            # Currently paused → resume.
+            self._pause_event.set()
+            self.pause_btn.config(text="Пауза")
+            self._append_log("Продолжаю работу.")
+            self.status_var.set("Работаю...")
 
     # ---- persistent settings -------------------------------------------
     def _current_settings(self) -> dict[str, object]:
@@ -564,6 +626,18 @@ class NovelDownloaderApp:
         rk = s.get("recent_api_keys")
         if isinstance(rk, list):
             self._recent_api_keys = [str(x) for x in rk if isinstance(x, str)]
+        # Push them into the live Combobox dropdowns so they appear
+        # immediately after launch.
+        if hasattr(self, "_url_combo"):
+            try:
+                self._url_combo["values"] = list(self._recent_urls)
+            except tk.TclError:
+                pass
+        if hasattr(self, "_key_combo"):
+            try:
+                self._key_combo["values"] = list(self._recent_api_keys)
+            except tk.TclError:
+                pass
 
     def _save_current_settings(self) -> None:
         try:
@@ -853,6 +927,7 @@ class NovelDownloaderApp:
                 progress=progress,
                 combined_path=combined,
                 cancel_event=cancel_event,
+                pause_event=self._pause_event,
             )
         except DownloadCancelled as exc:
             self._messages.put(_Error(
@@ -892,6 +967,7 @@ class NovelDownloaderApp:
             done = translate_folder(
                 src_dir, dst_dir, cfg,
                 force=force, progress=progress, cancel_event=cancel_event,
+                pause_event=self._pause_event,
                 wanted_numbers=wanted,
             )
         except TranslationCancelled as exc:

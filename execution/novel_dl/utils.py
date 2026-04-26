@@ -4,9 +4,35 @@ from __future__ import annotations
 
 import html as html_lib
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
+
+
+def wait_if_paused(
+    pause_event: "threading.Event | None",
+    cancel_event: "threading.Event | None" = None,
+    *,
+    poll_interval: float = 0.2,
+) -> None:
+    """Block while ``pause_event`` is *clear*; respect cancellation.
+
+    Convention: ``pause_event.is_set() == True`` means the worker may
+    proceed. A clear event means "paused — wait here". This matches the
+    threading.Event docs more naturally than the inverse.
+
+    If ``cancel_event`` is set at any point we return immediately —
+    callers are expected to check the cancel event right after.
+    """
+    if pause_event is None or pause_event.is_set():
+        return
+    while not pause_event.is_set():
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        # Short polling so a Resume click feels instant; the cost of a
+        # 200ms idle wait is negligible compared to a network request.
+        time.sleep(poll_interval)
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

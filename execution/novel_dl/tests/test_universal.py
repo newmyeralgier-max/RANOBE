@@ -410,7 +410,8 @@ def test_translator_refuses_to_write_empty_translation(tmp_path, monkeypatch):
 
     # Stub out the network. Title translates, body translates to "" (silent
     # refusal) — this is the scenario we need to catch.
-    def fake_translate(text, cfg, *, progress=None):
+    def fake_translate(text, cfg, *, progress=None, pause_event=None,
+                       cancel_event=None):
         return "Заголовок" if text.strip() == "Title" else ""
 
     monkeypatch.setattr(mod, "translate_text", fake_translate)
@@ -589,7 +590,7 @@ def test_translator_range_filter(tmp_path, monkeypatch):
     dst = tmp_path / "ru"
     monkeypatch.setattr(
         mod, "translate_text",
-        lambda text, cfg, *, progress=None: f"<<{text[:10]}>>",
+        lambda text, cfg, *, progress=None, pause_event=None, cancel_event=None: f"<<{text[:10]}>>",
     )
     cfg = mod.TranslatorConfig(api_key="x", model="m", system_prompt="p")
     got = mod.translate_folder(src, dst, cfg, wanted_numbers={2})

@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .utils import wait_if_paused
+
 DEFAULT_COHERE_MODEL = "command-a-03-2025"
 COHERE_CHAT_URL = "https://api.cohere.com/v2/chat"
 
@@ -192,6 +194,8 @@ def _too_long_vs_source(translated: str, source: str) -> bool:
 def translate_text(
     text: str, cfg: TranslatorConfig,
     *, progress: Callable[[str], None] | None = None,
+    pause_event: "threading.Event | None" = None,
+    cancel_event: "threading.Event | None" = None,
 ) -> str:
     """Translate a single block of text with one Cohere request.
 
@@ -215,6 +219,14 @@ def translate_text(
     }
     last_err: Exception | None = None
     for attempt in range(1, cfg.retries + 1):
+        # Honour pause/cancel before every attempt — including the
+        # first — so a user who clicks Pause right after Start gets
+        # immediate effect instead of having to wait through one
+        # whole round-trip first.
+        wait_if_paused(pause_event, cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            raise TranslationCancelled("Отменено перед запросом к Cohere.")
+
         temp = cfg.temperature + 0.1 * (attempt - 1)
         if progress:
             progress(
@@ -391,6 +403,7 @@ def translate_chapter_file(
     src: Path, dst: Path, cfg: TranslatorConfig,
     *, progress: Callable[[str], None] | None = None,
     cancel_event: "threading.Event | None" = None,
+    pause_event: "threading.Event | None" = None,
 ) -> None:
     """Translate one ``chapter_NNNN.txt`` file into ``dst``.
 
@@ -408,7 +421,11 @@ def translate_chapter_file(
         raise TranslationCancelled("Отменено до начала главы.")
 
     translated_title = (
-        translate_text(title, cfg, progress=progress) if title else ""
+        translate_text(
+            title, cfg, progress=progress,
+            pause_event=pause_event, cancel_event=cancel_event,
+        )
+        if title else ""
     )
     chunks = split_into_chunks(body, cfg.chunk_chars)
     translated_parts: list[str] = []
@@ -421,7 +438,10 @@ def translate_chapter_file(
             progress(
                 f"  чанк {i}/{len(chunks)} ({len(chunk)} символов)"
             )
-        translated_parts.append(translate_text(chunk, cfg, progress=progress))
+        translated_parts.append(translate_text(
+            chunk, cfg, progress=progress,
+            pause_event=pause_event, cancel_event=cancel_event,
+        ))
 
     translated_body = "\n\n".join(p for p in translated_parts if p).strip()
     if source_had_text and not translated_body:
@@ -441,6 +461,7 @@ def translate_folder(
     *, force: bool = False,
     progress: Callable[[str], None] | None = None,
     cancel_event: "threading.Event | None" = None,
+    pause_event: "threading.Event | None" = None,
     wanted_numbers: "set[int] | None" = None,
 ) -> list[Path]:
     """Translate every ``chapter_*.txt`` in ``src_dir`` into ``dst_dir``.
@@ -488,6 +509,7 @@ def translate_folder(
             translate_chapter_file(
                 src, dst, cfg,
                 progress=progress, cancel_event=cancel_event,
+                pause_event=pause_event,
             )
         except TranslationCancelled:
             raise
