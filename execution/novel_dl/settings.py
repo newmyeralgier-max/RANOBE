@@ -46,6 +46,11 @@ DEFAULTS: dict[str, object] = {
     "recent_api_keys": [],
     # Phase 2.4: dark mode toggle. Off by default — the user opts in.
     "dark_mode": False,
+    # Phase 3.2: cross-chapter context memory. On by default — drift
+    # between chapters is the main pain point users hit, the extra
+    # tokens are negligible against translation cost, and it can be
+    # turned off from the GUI for special cases.
+    "use_prior_context": True,
 }
 
 

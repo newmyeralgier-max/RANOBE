@@ -278,6 +278,117 @@ def test_translator_no_glossary_keeps_prompt_unchanged():
     assert _system_prompt_with_glossary(cfg) == "P"
 
 
+def test_tail_paragraphs_returns_last_n():
+    from novel_dl.translator import _tail_paragraphs
+    text = "Para A.\n\nPara B.\n\nPara C.\n\nPara D."
+    assert _tail_paragraphs(text, 2) == "Para C.\n\nPara D."
+    assert _tail_paragraphs(text, 1) == "Para D."
+    # n > total just returns everything.
+    assert _tail_paragraphs(text, 10).startswith("Para A.")
+
+
+def test_tail_paragraphs_handles_empty_and_whitespace():
+    from novel_dl.translator import _tail_paragraphs
+    assert _tail_paragraphs("", 2) == ""
+    assert _tail_paragraphs("\n\n   \n\n", 2) == ""
+
+
+def test_wrap_for_translation_includes_prior_context():
+    from novel_dl.translator import _wrap_for_translation
+    out = _wrap_for_translation(
+        "Hello world.", prior_context="Это контекст.",
+    )
+    assert "Это контекст." in out
+    # Source markers must still wrap the actual text to translate, not
+    # the context — otherwise the model would re-translate the context.
+    assert "Hello world." in out
+    src_begin = out.index("<<<ENGLISH_SOURCE_BEGIN>>>")
+    ctx_pos = out.index("Это контекст.")
+    assert ctx_pos < src_begin
+
+
+def test_wrap_for_translation_no_context_unchanged():
+    from novel_dl.translator import _wrap_for_translation
+    out = _wrap_for_translation("Hello.")
+    assert "Hello." in out
+    # No context block header should appear.
+    assert "контекст" not in out.lower()
+
+
+def test_translate_folder_threads_context_between_chapters(tmp_path, monkeypatch):
+    """Each chapter after the first should see the prior chapter's tail."""
+    import novel_dl.translator as tmod
+
+    src_dir = tmp_path / "src"
+    dst_dir = tmp_path / "dst"
+    src_dir.mkdir()
+    (src_dir / "chapter_0001_a.txt").write_text(
+        "# A\n\nFirst body para.\n\nSecond body para.\n",
+        encoding="utf-8",
+    )
+    (src_dir / "chapter_0002_b.txt").write_text(
+        "# B\n\nThird body para.\n\nFourth body para.\n",
+        encoding="utf-8",
+    )
+
+    seen_contexts: list[str] = []
+
+    def fake_translate(text, cfg, *, progress=None, pause_event=None,
+                       cancel_event=None, prior_context=""):
+        seen_contexts.append(prior_context)
+        # Echo the source so the dst body matches the src body — that
+        # keeps "tail of dst = tail of src" predictable for the test.
+        return text
+
+    monkeypatch.setattr(tmod, "translate_text", fake_translate)
+
+    cfg = tmod.TranslatorConfig(
+        api_key="x", model="m",
+        system_prompt="p",
+        use_prior_context=True,
+        prior_context_paragraphs=2,
+    )
+    tmod.translate_folder(src_dir, dst_dir, cfg)
+
+    # Calls: ch1 title, ch1 body, ch2 title, ch2 body. Title calls go
+    # with empty context (we don't pass it for titles); ch2 body call
+    # should include tail of ch1 body.
+    body_contexts = [c for c in seen_contexts if c]
+    assert any("Second body para." in c for c in body_contexts), (
+        f"expected ch1 tail in ch2 context; saw {seen_contexts!r}"
+    )
+
+
+def test_translate_folder_skips_context_when_disabled(tmp_path, monkeypatch):
+    import novel_dl.translator as tmod
+
+    src_dir = tmp_path / "src"
+    dst_dir = tmp_path / "dst"
+    src_dir.mkdir()
+    (src_dir / "chapter_0001_a.txt").write_text(
+        "# A\n\nP1.\n\nP2.\n", encoding="utf-8",
+    )
+    (src_dir / "chapter_0002_b.txt").write_text(
+        "# B\n\nP3.\n\nP4.\n", encoding="utf-8",
+    )
+
+    seen_contexts: list[str] = []
+
+    def fake_translate(text, cfg, *, progress=None, pause_event=None,
+                       cancel_event=None, prior_context=""):
+        seen_contexts.append(prior_context)
+        return text
+
+    monkeypatch.setattr(tmod, "translate_text", fake_translate)
+
+    cfg = tmod.TranslatorConfig(
+        api_key="x", model="m", system_prompt="p",
+        use_prior_context=False,
+    )
+    tmod.translate_folder(src_dir, dst_dir, cfg)
+    assert all(c == "" for c in seen_contexts)
+
+
 def test_snapshot_prunes_excess_backups(tmp_path):
     (tmp_path / "chapter_0001_test.txt").write_text("body", encoding="utf-8")
     # Create more than MAX_BACKUPS snapshots; pruning must keep the

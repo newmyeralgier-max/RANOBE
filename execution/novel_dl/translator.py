@@ -93,9 +93,36 @@ class TranslatorConfig:
     # between Джон / Иван / Юджин for the same character across
     # chapters. Empty list ⇒ no glossary fragment is appended.
     glossary: "list[tuple[str, str]]" = field(default_factory=list)
+    # Phase 3.2: feed the last N paragraphs of the previously-translated
+    # chapter as inline context into the next chapter's request. Helps
+    # the model keep pronouns, tense, narrative voice, and character
+    # names consistent across chapter boundaries. ``False`` keeps the
+    # old behaviour (no context) for users who want strictly chapter-
+    # local translations or want to save tokens.
+    use_prior_context: bool = True
+    prior_context_paragraphs: int = 2
 
 
-def _wrap_for_translation(text: str) -> str:
+def _tail_paragraphs(text: str, n: int = 2) -> str:
+    """Return the last ``n`` non-empty paragraphs of ``text``.
+
+    Used to feed cross-chapter context (a couple of trailing paragraphs
+    of the previous chapter's translation) into the next request so the
+    model keeps pronouns, tense, and character voice consistent. Returns
+    an empty string when ``text`` has no usable paragraphs — callers
+    treat empty as "no context, behave as before".
+    """
+    if not text:
+        return ""
+    paragraphs = [
+        p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()
+    ]
+    if not paragraphs:
+        return ""
+    return "\n\n".join(paragraphs[-n:])
+
+
+def _wrap_for_translation(text: str, *, prior_context: str = "") -> str:
     """Frame the source text so the model can't mistake it for a prompt.
 
     Cohere's command-a models will happily continue in the style of any
@@ -110,7 +137,16 @@ def _wrap_for_translation(text: str) -> str:
     ("Ahhhhhhhh!" -> "А-а-а-а-а-а..." × 8000 chars), blowing the output
     budget and truncating the rest of the chapter.
     """
+    context_block = ""
+    if prior_context:
+        context_block = (
+            "Для согласованности перевода — последние абзацы предыдущей "
+            "главы (это уже готовый русский, НЕ переводи их обратно, "
+            "просто учти стиль/тон/имена/род/время):\n\n"
+            f"{prior_context}\n\n---\n\n"
+        )
     return (
+        f"{context_block}"
         "Переведи приведённый ниже английский отрывок на русский язык "
         "литературно и точно. Переводи ИМЕННО тот текст, что находится "
         f"между маркерами {_SRC_BEGIN} и {_SRC_END}. Не добавляй ничего "
@@ -220,6 +256,7 @@ def translate_text(
     *, progress: Callable[[str], None] | None = None,
     pause_event: "threading.Event | None" = None,
     cancel_event: "threading.Event | None" = None,
+    prior_context: str = "",
 ) -> str:
     """Translate a single block of text with one Cohere request.
 
@@ -262,7 +299,12 @@ def translate_text(
             "model": cfg.model,
             "messages": [
                 {"role": "system", "content": _system_prompt_with_glossary(cfg)},
-                {"role": "user", "content": _wrap_for_translation(text)},
+                {
+                    "role": "user",
+                    "content": _wrap_for_translation(
+                        text, prior_context=prior_context,
+                    ),
+                },
             ],
             "temperature": temp,
         }
@@ -429,7 +471,8 @@ def translate_chapter_file(
     cancel_event: "threading.Event | None" = None,
     pause_event: "threading.Event | None" = None,
     chunk_done: Callable[[int], None] | None = None,
-) -> None:
+    prior_context: str = "",
+) -> str:
     """Translate one ``chapter_NNNN.txt`` file into ``dst``.
 
     Preserves the ``# Title`` header (we translate the title separately so
@@ -437,6 +480,10 @@ def translate_chapter_file(
     Refuses to write an empty translated file if the source had text —
     that way a silent model refusal surfaces as an error rather than as
     a corrupted library.
+
+    Returns the translated body (without the title header) so the caller
+    can feed its tail paragraphs as ``prior_context`` into the next
+    chapter for cross-chapter consistency.
     """
     raw = src.read_text(encoding="utf-8")
     title, body = _split_title(raw)
@@ -449,11 +496,18 @@ def translate_chapter_file(
         translate_text(
             title, cfg, progress=progress,
             pause_event=pause_event, cancel_event=cancel_event,
+            # Title is short and stylistically distinct — passing prior
+            # context here just confuses the model into echoing.
         )
         if title else ""
     )
     chunks = split_into_chunks(body, cfg.chunk_chars)
     translated_parts: list[str] = []
+    # Only the FIRST chunk of a chapter gets cross-chapter context —
+    # subsequent chunks of the same chapter already have local
+    # continuity from the source itself, and including the previous
+    # chapter's tail in every chunk would inflate token use linearly.
+    first_chunk_context = prior_context if cfg.use_prior_context else ""
     for i, chunk in enumerate(chunks, start=1):
         if cancel_event is not None and cancel_event.is_set():
             raise TranslationCancelled(
@@ -466,6 +520,7 @@ def translate_chapter_file(
         translated_parts.append(translate_text(
             chunk, cfg, progress=progress,
             pause_event=pause_event, cancel_event=cancel_event,
+            prior_context=first_chunk_context if i == 1 else "",
         ))
         # Report char-level progress AFTER a chunk lands successfully so
         # a failed/retried chunk doesn't double-count. The callback may
@@ -473,7 +528,7 @@ def translate_chapter_file(
         if chunk_done is not None:
             try:
                 chunk_done(len(chunk))
-            except Exception:  # pragma: no cover \u2014 callback is GUI-side
+            except Exception:  # pragma: no cover — callback is GUI-side
                 pass
 
     translated_body = "\n\n".join(p for p in translated_parts if p).strip()
@@ -487,6 +542,7 @@ def translate_chapter_file(
     dst.parent.mkdir(parents=True, exist_ok=True)
     header = f"# {translated_title or title or 'Без названия'}"
     dst.write_text(f"{header}\n\n{translated_body}\n", encoding="utf-8")
+    return translated_body
 
 
 def translate_folder(
@@ -522,6 +578,12 @@ def translate_folder(
     dst_dir.mkdir(parents=True, exist_ok=True)
     done: list[Path] = []
     last_ok_idx: int | None = None
+    # Cross-chapter context: tail of the previous chapter's translation,
+    # threaded into the next chapter's first chunk. Survives skipped
+    # (cached) chapters by reading the tail off the existing dst file
+    # so a partial run still gets continuity.
+    prior_context = ""
+    n_ctx = max(0, cfg.prior_context_paragraphs)
 
     for i, src in enumerate(files, start=1):
         if cancel_event is not None and cancel_event.is_set():
@@ -536,15 +598,25 @@ def translate_folder(
                 progress(f"[{i}/{len(files)}] skip (exists): {src.name}")
             done.append(dst)
             last_ok_idx = i
+            # Even for cached files, capture the tail so the NEXT
+            # chapter sees consistent context. Cheap (one read).
+            if cfg.use_prior_context and n_ctx > 0:
+                try:
+                    cached_raw = dst.read_text(encoding="utf-8")
+                    _, cached_body = _split_title(cached_raw)
+                    prior_context = _tail_paragraphs(cached_body, n_ctx)
+                except OSError:
+                    prior_context = ""
             continue
         if progress:
             progress(f"[{i}/{len(files)}] translating: {src.name}")
         try:
-            translate_chapter_file(
+            translated_body = translate_chapter_file(
                 src, dst, cfg,
                 progress=progress, cancel_event=cancel_event,
                 pause_event=pause_event,
                 chunk_done=chunk_done,
+                prior_context=prior_context if cfg.use_prior_context else "",
             )
         except TranslationCancelled:
             raise
@@ -556,6 +628,9 @@ def translate_folder(
             ) from exc
         done.append(dst)
         last_ok_idx = i
+        # Refresh context for the next chapter from what we just wrote.
+        if cfg.use_prior_context and n_ctx > 0:
+            prior_context = _tail_paragraphs(translated_body, n_ctx)
     return done
 
 

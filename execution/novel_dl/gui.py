@@ -470,6 +470,16 @@ class NovelDownloaderApp:
                         variable=self.retranslate_var).pack(
             side="left", padx=(12, 0),
         )
+        # Phase 3.2: context memory. On by default — keeps pronouns,
+        # tense, and character names consistent across chapter
+        # boundaries by feeding the previous chapter's tail into the
+        # next request. Costs ~150–300 extra tokens per chapter.
+        self.use_context_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            tr_btns,
+            text="Память контекста (последние абзацы прошлой главы)",
+            variable=self.use_context_var,
+        ).pack(side="left", padx=(12, 0))
 
         epub_row = ttk.Frame(tr)
         epub_row.pack(fill="x", padx=8, pady=(2, 8))
@@ -728,6 +738,7 @@ class NovelDownloaderApp:
             "recent_urls": list(self._recent_urls),
             "recent_api_keys": list(self._recent_api_keys),
             "dark_mode": bool(self.dark_mode_var.get()),
+            "use_prior_context": bool(self.use_context_var.get()),
         }
 
     def _apply_settings(self, s: dict[str, object]) -> None:
@@ -790,6 +801,7 @@ class NovelDownloaderApp:
         # post-launch toggle and the persisted-config restore symmetric.
         self.dark_mode_var.set(_b("dark_mode", False))
         self._apply_theme(self.dark_mode_var.get())
+        self.use_context_var.set(_b("use_prior_context", True))
 
     def _save_current_settings(self) -> None:
         try:
@@ -918,6 +930,7 @@ class NovelDownloaderApp:
         cfg = TranslatorConfig(
             api_key=api_key, model=model, system_prompt=prompt,
             glossary=list(self._glossary),
+            use_prior_context=bool(self.use_context_var.get()),
         )
 
         available_nums = sorted(_chapter_numbers_in(src_dir))
