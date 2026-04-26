@@ -25,11 +25,13 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable
 
+from .backup import snapshot_dir
 from .core import Book, UnsupportedSiteError
 from .downloader import DownloadCancelled, DownloadError, download_chapters
 from .epub import build_epub_from_folder
 from .registry import get_adapter
-from .settings import load_settings, save_settings
+from .runlog import RunLog, open_in_system_editor, prune_old_logs
+from .settings import load_settings, push_recent, save_settings
 from .translator import (
     DEFAULT_COHERE_MODEL,
     TranslationCancelled,
@@ -124,8 +126,25 @@ class NovelDownloaderApp:
         # generic "Скачано N/M" regardless of which op is running.
         self._operation_label: str = ""
 
+        # Open the per-run log file before any other init so even early
+        # exceptions during widget construction get captured.
+        prune_old_logs()
+        self._runlog = RunLog()
+
+        # In-memory copies of the "last 5" history lists. Persisted via
+        # the same atomic save_settings call as everything else.
+        self._recent_urls: list[str] = []
+        self._recent_api_keys: list[str] = []
+
+        # Debounce token for autosave-on-change. tkinter "after" returns
+        # an id we can cancel so multiple keystrokes coalesce into one
+        # write 500ms after the last keystroke.
+        self._autosave_after_id: str | None = None
+        self._autosave_armed = False
+
         self._build_widgets()
         self._apply_settings(load_settings())
+        self._install_autosave_traces()
         self._set_state_idle()
         _install_layout_agnostic_clipboard_bindings(self.root)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -319,14 +338,28 @@ class NovelDownloaderApp:
         self.status_label.pack(side="bottom", fill="x", padx=10, pady=(0, 2))
         log_frame.pack(side="bottom", fill="both", expand=True, **pad)
 
+        # Toolbar row inside the log frame: "Open log file" button so the
+        # user can hand the .log straight to me when something breaks
+        # without having to find ~/.novel_dl/runs themselves.
+        log_toolbar = ttk.Frame(log_frame)
+        log_toolbar.pack(side="top", fill="x", padx=8, pady=(6, 0))
+        ttk.Button(
+            log_toolbar, text="Открыть файл лога", command=self._on_open_log,
+        ).pack(side="right")
+        ttk.Label(
+            log_toolbar,
+            foreground="#555",
+            text="полный лог пишется в ~/.novel_dl/runs/",
+        ).pack(side="left")
+
         # height=15 rows ≈ 280px on default font — well above the "1 line"
         # collapse the user reported.
         self.log = tk.Text(
             log_frame, wrap="word", state="disabled", height=15,
         )
-        self.log.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+        self.log.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(4, 8))
         log_sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
-        log_sb.pack(side="right", fill="y", pady=8, padx=(0, 8))
+        log_sb.pack(side="right", fill="y", pady=(4, 8), padx=(0, 8))
         self.log.configure(yscrollcommand=log_sb.set)
 
     # ---- state transitions ---------------------------------------------
@@ -389,6 +422,7 @@ class NovelDownloaderApp:
         self._cancel_event = threading.Event()
         self._set_state_loading()
         self._append_log(f"[site={self._adapter.site_id}] загружаю {url}")
+        self._push_recent_url(url)
         self._save_current_settings()
         cancel_event = self._cancel_event
         self._spawn(lambda: self._worker_fetch_book(url, cancel_event))
@@ -451,6 +485,9 @@ class NovelDownloaderApp:
             f"Скачиваю {len(indices)} глав (первая {indices[0]}, последняя {indices[-1]}) "
             f"в {out_dir}"
         )
+        snap = snapshot_dir(out_dir, label="download")
+        if snap is not None:
+            self._append_log(f"Бэкап перед скачкой: {snap}")
         self._save_current_settings()
         self._spawn(lambda: self._worker_download(adapter, book, indices,
                                                   out_dir, combined, force,
@@ -480,6 +517,8 @@ class NovelDownloaderApp:
             "retranslate": bool(self.retranslate_var.get()),
             "epub_range": self.epub_range_var.get(),
             "epub_source": self.epub_source_var.get(),
+            "recent_urls": list(self._recent_urls),
+            "recent_api_keys": list(self._recent_api_keys),
         }
 
     def _apply_settings(self, s: dict[str, object]) -> None:
@@ -517,6 +556,14 @@ class NovelDownloaderApp:
             self.epub_range_var.set(_s("epub_range"))
         if _s("epub_source"):
             self.epub_source_var.set(_s("epub_source"))
+        # Restore recent-history lists. These never get "unset" — empty
+        # list is fine, just means there's nothing in the dropdowns yet.
+        ru = s.get("recent_urls")
+        if isinstance(ru, list):
+            self._recent_urls = [str(x) for x in ru if isinstance(x, str)]
+        rk = s.get("recent_api_keys")
+        if isinstance(rk, list):
+            self._recent_api_keys = [str(x) for x in rk if isinstance(x, str)]
 
     def _save_current_settings(self) -> None:
         try:
@@ -524,8 +571,69 @@ class NovelDownloaderApp:
         except Exception as exc:  # pragma: no cover
             self._append_log(f"Не удалось сохранить настройки: {exc}")
 
+    # ---- autosave-on-change --------------------------------------------
+    def _install_autosave_traces(self) -> None:
+        """Trace every persistent tk variable; debounced save on change.
+
+        Without this, settings only get written when the user runs an
+        operation or closes the window. A crash mid-edit would lose any
+        URL/key/prompt the user just typed. Now we save 500ms after the
+        last keystroke / checkbox flip.
+        """
+        traced_vars = (
+            self.url_var, self.output_var, self.range_var,
+            self.combined_var, self.force_var,
+            self.cohere_key_var, self.save_api_key_var,
+            self.cohere_model_var,
+            self.translate_src_var, self.translate_range_var,
+            self.retranslate_var,
+            self.epub_source_var, self.epub_range_var,
+        )
+        for var in traced_vars:
+            try:
+                var.trace_add("write", self._on_setting_changed)
+            except (AttributeError, tk.TclError):
+                continue
+        # The prompt is a Text widget, not a Var — bind to <KeyRelease>.
+        try:
+            self.prompt_text.bind(
+                "<KeyRelease>", lambda _e: self._on_setting_changed(),
+            )
+        except (AttributeError, tk.TclError):
+            pass
+        self._autosave_armed = True
+
+    def _on_setting_changed(self, *_args: object) -> None:
+        if not self._autosave_armed:
+            return
+        if self._autosave_after_id is not None:
+            try:
+                self.root.after_cancel(self._autosave_after_id)
+            except (tk.TclError, ValueError):
+                pass
+        self._autosave_after_id = self.root.after(
+            500, self._autosave_flush,
+        )
+
+    def _autosave_flush(self) -> None:
+        self._autosave_after_id = None
+        try:
+            save_settings(self._current_settings())
+        except Exception:  # pragma: no cover — best-effort
+            pass
+
     def _on_close(self) -> None:
+        if self._autosave_after_id is not None:
+            try:
+                self.root.after_cancel(self._autosave_after_id)
+            except (tk.TclError, ValueError):
+                pass
+            self._autosave_after_id = None
         self._save_current_settings()
+        try:
+            self._runlog.close()
+        except Exception:  # pragma: no cover
+            pass
         self.root.destroy()
 
     # ---- translate / epub --------------------------------------------
@@ -620,6 +728,10 @@ class NovelDownloaderApp:
             f"Перевод {files_count} глав (из {len(available_nums)}) "
             f"→ {dst_dir} (модель {model})"
         )
+        snap = snapshot_dir(dst_dir, label="translate")
+        if snap is not None:
+            self._append_log(f"Бэкап перед переводом: {snap}")
+        self._push_recent_key(cfg.api_key)
         self._save_current_settings()
         self._spawn(lambda: self._worker_translate(
             src_dir, dst_dir, cfg, force, self._cancel_event, wanted,
@@ -688,6 +800,9 @@ class NovelDownloaderApp:
         self._append_log(
             f"Собираю EPUB из {src_dir} ({len(wanted)} глав) → {epub_path}"
         )
+        snap = snapshot_dir(src_dir, label="epub")
+        if snap is not None:
+            self._append_log(f"Бэкап перед сборкой EPUB: {snap}")
         self._save_current_settings()
         self._spawn(lambda: self._worker_build_epub(
             src_dir, epub_path, title, author, wanted,
@@ -908,6 +1023,53 @@ class NovelDownloaderApp:
         self.log.insert("end", text + "\n")
         self.log.see("end")
         self.log.config(state="disabled")
+        try:
+            self._runlog.write(text)
+        except Exception:  # pragma: no cover — file logger is best-effort
+            pass
+
+    def _on_open_log(self) -> None:
+        """Open the current run's log file in the user's editor."""
+        path = getattr(self._runlog, "path", None)
+        if path is None or not path.exists():
+            messagebox.showinfo(
+                "Лог",
+                "Файл лога ещё не создан или недоступен (см. ~/.novel_dl/runs).",
+            )
+            return
+        if not open_in_system_editor(path):
+            messagebox.showinfo(
+                "Лог",
+                f"Файл лога:\n{path}\n\nОткрой его вручную — "
+                f"автоматически открыть не получилось.",
+            )
+
+    def _push_recent_url(self, url: str) -> None:
+        url = (url or "").strip()
+        if not url:
+            return
+        self._recent_urls = push_recent(self._recent_urls, url)
+        if hasattr(self, "_url_combo"):
+            try:
+                self._url_combo["values"] = list(self._recent_urls)
+            except tk.TclError:
+                pass
+
+    def _push_recent_key(self, key: str) -> None:
+        key = (key or "").strip()
+        if not key:
+            return
+        # Privacy: only stash keys when the user has explicitly opted into
+        # persisting them. Otherwise the in-memory list still tracks them
+        # for this session's dropdown but we won't write to disk.
+        if not bool(self.save_api_key_var.get()):
+            return
+        self._recent_api_keys = push_recent(self._recent_api_keys, key)
+        if hasattr(self, "_key_combo"):
+            try:
+                self._key_combo["values"] = list(self._recent_api_keys)
+            except tk.TclError:
+                pass
 
 
 _CHAPTER_NUM_RE = re.compile(r"^chapter_(\d{1,6})_")
