@@ -100,6 +100,21 @@ class _ProgressMsg:
     total: int
 
 
+@dataclass
+class _CharsMsg:
+    """Char-level translation progress: ``done`` of ``total`` chars completed.
+
+    The translator emits one of these per finished chunk so the bar moves
+    smoothly even inside a single long chapter, instead of jumping by
+    whole chapters every 30+ seconds.
+    """
+
+    done: int
+    total: int
+    chapters_done: int = 0
+    chapters_total: int = 0
+
+
 # ---- app ------------------------------------------------------------------
 
 class NovelDownloaderApp:
@@ -953,22 +968,89 @@ class NovelDownloaderApp:
                            cfg: TranslatorConfig, force: bool,
                            cancel_event: threading.Event,
                            wanted: set[int]) -> None:
-        counter = {"i": 0}
-        total = len(wanted)
+        files_total = len(wanted)
+
+        # Pre-scan source files to compute total char count across the
+        # selection. This lets the progress bar advance smoothly per chunk
+        # instead of jumping every chapter. Cached files (dst already
+        # exists) count as "already done" so the bar starts at the right
+        # offset and finishes at 100% even if half the work was skipped.
+        chars_total = 0
+        chars_pre_done = 0
+        chapters_pre_done = 0
+        for src in sorted(src_dir.glob("chapter_*.txt")):
+            num = _chapter_number_for(src)
+            if num is None or num not in wanted:
+                continue
+            try:
+                body_len = _approx_body_chars(src)
+            except OSError:
+                body_len = 0
+            chars_total += body_len
+            dst = dst_dir / src.name
+            if dst.exists() and not force:
+                chars_pre_done += body_len
+                chapters_pre_done += 1
+
+        counter = {
+            "chars": chars_pre_done,
+            "chapters": chapters_pre_done,
+        }
 
         def progress(msg: str) -> None:
             self._messages.put(_LogMsg(msg))
-            # Count only top-level "[i/N]" file transitions, not chunk logs.
-            if msg.lstrip().startswith("["):
-                counter["i"] += 1
-                self._messages.put(_ProgressMsg(counter["i"], total))
+            stripped = msg.lstrip()
+            if stripped.startswith("[") and (
+                "skip" in stripped or "translating" in stripped
+            ):
+                # Count only top-level "[i/N]" file transitions.
+                if "skip" in stripped:
+                    # Already counted in pre-scan; still publish so the
+                    # status line moves.
+                    self._messages.put(_CharsMsg(
+                        done=counter["chars"],
+                        total=max(chars_total, 1),
+                        chapters_done=counter["chapters"],
+                        chapters_total=files_total,
+                    ))
+                else:
+                    self._messages.put(_CharsMsg(
+                        done=counter["chars"],
+                        total=max(chars_total, 1),
+                        chapters_done=counter["chapters"],
+                        chapters_total=files_total,
+                    ))
+
+        def chunk_done(n_chars: int) -> None:
+            counter["chars"] += n_chars
+            self._messages.put(_CharsMsg(
+                done=counter["chars"],
+                total=max(chars_total, 1),
+                chapters_done=counter["chapters"],
+                chapters_total=files_total,
+            ))
+
+        # Bump chapters_done after each top-level file transition message.
+        # We piggyback on the existing progress() callback by scanning
+        # for the "translating: chapter_NNNN" prefix.
+        original_progress = progress
+
+        def progress_with_chapter_count(msg: str) -> None:
+            stripped = msg.lstrip()
+            if stripped.startswith("[") and (
+                "translating" in stripped or "skip" in stripped
+            ):
+                counter["chapters"] += 1
+            original_progress(msg)
 
         try:
             done = translate_folder(
                 src_dir, dst_dir, cfg,
-                force=force, progress=progress, cancel_event=cancel_event,
+                force=force, progress=progress_with_chapter_count,
+                cancel_event=cancel_event,
                 pause_event=self._pause_event,
                 wanted_numbers=wanted,
+                chunk_done=chunk_done,
             )
         except TranslationCancelled as exc:
             self._messages.put(_Error(
@@ -1026,6 +1108,16 @@ class NovelDownloaderApp:
             self.progress.config(value=msg.current, maximum=msg.total)
             label = self._operation_label or "Прогресс"
             self.status_var.set(f"{label}: {msg.current}/{msg.total}")
+        elif isinstance(msg, _CharsMsg):
+            # Char-based bar for translation: smooth motion even inside a
+            # single 12000-character chapter that takes 30+ seconds.
+            self.progress.config(value=msg.done, maximum=msg.total)
+            done_k = msg.done / 1000
+            total_k = msg.total / 1000
+            self.status_var.set(
+                f"Переведено: {done_k:.1f}K/{total_k:.1f}K символов "
+                f"({msg.chapters_done}/{msg.chapters_total} глав)"
+            )
         elif isinstance(msg, _BookReady):
             self._book = msg.book
             total = len(msg.book.chapters)
@@ -1159,6 +1251,31 @@ def _chapter_numbers_in(src_dir: Path) -> set[int]:
         if m:
             out.add(int(m.group(1)))
     return out
+
+
+def _chapter_number_for(path: Path) -> int | None:
+    """Return the chapter number embedded in a ``chapter_NNNN_*.txt`` filename."""
+    m = _CHAPTER_NUM_RE.match(path.name)
+    return int(m.group(1)) if m else None
+
+
+def _approx_body_chars(src: Path) -> int:
+    """Approximate the translatable-body length of a chapter file.
+
+    Subtracts the leading ``# Title`` line + blank line so the char-progress
+    bar matches what the translator actually feeds to Cohere. Falls back to
+    the full file size on read errors so we still get a useful estimate
+    without crashing the worker.
+    """
+    raw = src.read_text(encoding="utf-8", errors="replace")
+    # Strip the header (we still translate it, but it's tiny — under 1%
+    # of body chars on average — so excluding it makes the bar less
+    # jittery on short chapters).
+    if raw.startswith("# "):
+        nl = raw.find("\n\n")
+        if nl != -1:
+            raw = raw[nl + 2:]
+    return len(raw)
 
 
 def _parse_chapter_number_spec(spec: str, available: list[int]) -> set[int] | None:

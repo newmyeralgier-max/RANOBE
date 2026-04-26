@@ -404,6 +404,7 @@ def translate_chapter_file(
     *, progress: Callable[[str], None] | None = None,
     cancel_event: "threading.Event | None" = None,
     pause_event: "threading.Event | None" = None,
+    chunk_done: Callable[[int], None] | None = None,
 ) -> None:
     """Translate one ``chapter_NNNN.txt`` file into ``dst``.
 
@@ -442,6 +443,14 @@ def translate_chapter_file(
             chunk, cfg, progress=progress,
             pause_event=pause_event, cancel_event=cancel_event,
         ))
+        # Report char-level progress AFTER a chunk lands successfully so
+        # a failed/retried chunk doesn't double-count. The callback may
+        # update a global progress bar that spans the whole folder.
+        if chunk_done is not None:
+            try:
+                chunk_done(len(chunk))
+            except Exception:  # pragma: no cover \u2014 callback is GUI-side
+                pass
 
     translated_body = "\n\n".join(p for p in translated_parts if p).strip()
     if source_had_text and not translated_body:
@@ -463,6 +472,7 @@ def translate_folder(
     cancel_event: "threading.Event | None" = None,
     pause_event: "threading.Event | None" = None,
     wanted_numbers: "set[int] | None" = None,
+    chunk_done: Callable[[int], None] | None = None,
 ) -> list[Path]:
     """Translate every ``chapter_*.txt`` in ``src_dir`` into ``dst_dir``.
 
@@ -510,6 +520,7 @@ def translate_folder(
                 src, dst, cfg,
                 progress=progress, cancel_event=cancel_event,
                 pause_event=pause_event,
+                chunk_done=chunk_done,
             )
         except TranslationCancelled:
             raise
