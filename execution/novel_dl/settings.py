@@ -44,6 +44,8 @@ DEFAULTS: dict[str, object] = {
     # (matching the privacy contract for the single ``api_key`` field).
     "recent_urls": [],
     "recent_api_keys": [],
+    # Phase 2.4: dark mode toggle. Off by default — the user opts in.
+    "dark_mode": False,
 }
 
 

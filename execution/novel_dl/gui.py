@@ -317,6 +317,16 @@ class NovelDownloaderApp:
             text="Запомнить ключ на этом ПК (в ~/.novel_dl/config.json)",
             variable=self.save_api_key_var,
         ).pack(side="left")
+        # Dark-mode toggle. The checkbox lives next to "save api key" so
+        # users see all the on/off knobs in one row instead of hunting
+        # for an Options menu.
+        self.dark_mode_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            key_opt_row,
+            text="Тёмная тема",
+            variable=self.dark_mode_var,
+            command=self._on_dark_mode_toggle,
+        ).pack(side="right")
 
         prompt_frame = ttk.Frame(tr)
         prompt_frame.pack(fill="x", padx=8, pady=(4, 4))
@@ -629,6 +639,7 @@ class NovelDownloaderApp:
             "epub_source": self.epub_source_var.get(),
             "recent_urls": list(self._recent_urls),
             "recent_api_keys": list(self._recent_api_keys),
+            "dark_mode": bool(self.dark_mode_var.get()),
         }
 
     def _apply_settings(self, s: dict[str, object]) -> None:
@@ -686,6 +697,11 @@ class NovelDownloaderApp:
                 self._key_combo["values"] = list(self._recent_api_keys)
             except tk.TclError:
                 pass
+        # Apply dark mode AFTER widgets exist; on the first call this is
+        # a no-op for the (default) light theme, but it makes the
+        # post-launch toggle and the persisted-config restore symmetric.
+        self.dark_mode_var.set(_b("dark_mode", False))
+        self._apply_theme(self.dark_mode_var.get())
 
     def _save_current_settings(self) -> None:
         try:
@@ -1247,6 +1263,151 @@ class NovelDownloaderApp:
                 f"Файл лога:\n{path}\n\nОткрой его вручную — "
                 f"автоматически открыть не получилось.",
             )
+
+    # ---- theme ----------------------------------------------------------
+    def _on_dark_mode_toggle(self) -> None:
+        """Apply the new theme immediately and persist via the autosave path."""
+        self._apply_theme(bool(self.dark_mode_var.get()))
+        # Bypass debounce — theme is a deliberate user action, not a
+        # keystroke flurry, so save right away.
+        self._save_current_settings()
+
+    def _apply_theme(self, dark: bool) -> None:
+        """Switch ttk style + raw Text/Listbox colors to the requested theme.
+
+        ttk's vista/aqua native themes can't be re-coloured via Style
+        configure, so dark mode forces the ``clam`` theme (which is
+        scriptable on every platform). Light mode goes back to the
+        platform default if available, falling back to clam.
+
+        Tkinter's ``tk.Text`` and the ``ttk.Combobox`` popup ListBox
+        live outside ttk's style system — we paint them directly with
+        ``configure(bg=..., fg=...)`` and option_add for the popup.
+        """
+        style = ttk.Style(self.root)
+        if dark:
+            try:
+                style.theme_use("clam")
+            except tk.TclError:
+                pass
+            palette = {
+                "bg": "#1e1e1e",
+                "fg": "#dcdcdc",
+                "panel": "#252526",
+                "entry_bg": "#2d2d30",
+                "entry_fg": "#dcdcdc",
+                "select_bg": "#264f78",
+                "select_fg": "#ffffff",
+                "muted": "#8a8a8a",
+                "accent": "#3a8edb",
+                "border": "#3f3f46",
+            }
+        else:
+            for name in ("vista", "winnative", "aqua", "clam", "default"):
+                try:
+                    style.theme_use(name)
+                    break
+                except tk.TclError:
+                    continue
+            palette = {
+                "bg": "#f0f0f0",
+                "fg": "#000000",
+                "panel": "#f0f0f0",
+                "entry_bg": "#ffffff",
+                "entry_fg": "#000000",
+                "select_bg": "#0078d7",
+                "select_fg": "#ffffff",
+                "muted": "#555555",
+                "accent": "#0078d7",
+                "border": "#cccccc",
+            }
+        self.root.configure(bg=palette["bg"])
+        # ttk widget colour overrides. On the native (vista/aqua)
+        # themes most of these are no-ops, which is what we want — light
+        # mode then keeps the OS look.
+        for cls in (
+            "TFrame", "TLabel", "TLabelframe", "TLabelframe.Label",
+            "TCheckbutton", "TRadiobutton",
+        ):
+            style.configure(cls, background=palette["bg"], foreground=palette["fg"])
+        style.configure(
+            "TButton",
+            background=palette["panel"], foreground=palette["fg"],
+        )
+        style.map(
+            "TButton",
+            background=[("active", palette["select_bg"])],
+            foreground=[("active", palette["select_fg"])],
+        )
+        style.configure(
+            "TEntry",
+            fieldbackground=palette["entry_bg"],
+            foreground=palette["entry_fg"],
+            insertcolor=palette["fg"],
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground=palette["entry_bg"],
+            background=palette["panel"],
+            foreground=palette["entry_fg"],
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", palette["entry_bg"])],
+            foreground=[("readonly", palette["entry_fg"])],
+        )
+        # Treeview rows + headings.
+        style.configure(
+            "Treeview",
+            background=palette["entry_bg"],
+            fieldbackground=palette["entry_bg"],
+            foreground=palette["entry_fg"],
+            bordercolor=palette["border"],
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", palette["select_bg"])],
+            foreground=[("selected", palette["select_fg"])],
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=palette["panel"],
+            foreground=palette["fg"],
+        )
+        style.configure(
+            "TProgressbar",
+            background=palette["accent"],
+            troughcolor=palette["panel"],
+        )
+        # tk.Text / tk.Listbox are not ttk-styled; configure directly.
+        for text_widget in (
+            getattr(self, "prompt_text", None),
+            getattr(self, "log_text", None),
+        ):
+            if text_widget is None:
+                continue
+            try:
+                text_widget.configure(
+                    background=palette["entry_bg"],
+                    foreground=palette["entry_fg"],
+                    insertbackground=palette["fg"],
+                    selectbackground=palette["select_bg"],
+                    selectforeground=palette["select_fg"],
+                )
+            except tk.TclError:
+                pass
+        # Combobox dropdown popup is a tk Listbox inside the X server;
+        # only option_add reaches it. Affects newly-opened popups; the
+        # already-open one (if any) will pick up the colours next time
+        # the user clicks the arrow.
+        self.root.option_add("*TCombobox*Listbox.background", palette["entry_bg"])
+        self.root.option_add("*TCombobox*Listbox.foreground", palette["entry_fg"])
+        self.root.option_add(
+            "*TCombobox*Listbox.selectBackground", palette["select_bg"],
+        )
+        self.root.option_add(
+            "*TCombobox*Listbox.selectForeground", palette["select_fg"],
+        )
 
     # ---- chapter status tree -------------------------------------------
     def _populate_chapter_tree(self) -> None:
