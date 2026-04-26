@@ -22,6 +22,10 @@ from novel_dl import settings as settings_mod  # noqa: E402
 from novel_dl.backup import snapshot_dir  # noqa: E402
 from novel_dl.runlog import RunLog, prune_old_logs  # noqa: E402
 from novel_dl.settings import push_recent  # noqa: E402
+from novel_dl.update_check import (  # noqa: E402
+    UpdateStatus,
+    check_for_updates,
+)
 from novel_dl.utils import wait_if_paused  # noqa: E402
 
 # ---- settings.push_recent -----------------------------------------------
@@ -197,6 +201,19 @@ def test_wait_if_paused_returns_on_cancel_even_when_still_paused():
     elapsed = time.monotonic() - t
     assert cancel.is_set()
     assert elapsed < 1.0
+
+
+def test_update_check_handles_non_git_dir(tmp_path):
+    status = check_for_updates(tmp_path, do_fetch=False)
+    assert isinstance(status, UpdateStatus)
+    assert status.error is not None
+    assert not status.has_updates
+
+
+def test_update_status_has_updates_property():
+    assert UpdateStatus(behind=2).has_updates is True
+    assert UpdateStatus(behind=0).has_updates is False
+    assert UpdateStatus(behind=5, error="boom").has_updates is False
 
 
 def test_snapshot_prunes_excess_backups(tmp_path):

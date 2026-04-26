@@ -39,6 +39,11 @@ from .translator import (
     TranslatorConfig,
     translate_folder,
 )
+from .update_check import (
+    UpdateStatus,
+    check_for_updates,
+    fast_forward_pull,
+)
 from .utils import FetchError, parse_range_spec, safe_filename
 
 DEFAULT_TRANSLATOR_PROMPT = (
@@ -98,6 +103,13 @@ class _Error:
 class _ProgressMsg:
     current: int
     total: int
+
+
+@dataclass
+class _UpdateMsg:
+    """Background-thread result of the startup ``git fetch`` check."""
+
+    status: UpdateStatus
 
 
 @dataclass
@@ -171,9 +183,37 @@ class NovelDownloaderApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._drain_messages)
 
+        # Kick off the update check in a daemon thread. Cheap (one git
+        # fetch), runs once at startup. The result lands as an
+        # _UpdateMsg in the regular message queue so we don't touch tk
+        # from the worker thread.
+        threading.Thread(
+            target=self._update_check_worker,
+            name="update-check",
+            daemon=True,
+        ).start()
+
     # ---- UI layout ------------------------------------------------------
     def _build_widgets(self) -> None:
         pad = {"padx": 10, "pady": 6}
+
+        # Update banner. Hidden until the background check finishes.
+        # Lives at the very top so it doesn't bump the rest of the
+        # layout when it appears.
+        self._update_banner = ttk.Frame(self.root)
+        self._update_banner_label = ttk.Label(
+            self._update_banner,
+            text="",
+            foreground="#0078d7",
+            anchor="w",
+        )
+        self._update_banner_label.pack(side="left", padx=(8, 6), pady=4)
+        self._update_btn = ttk.Button(
+            self._update_banner, text="Обновить",
+            command=self._on_update_pull,
+        )
+        self._update_btn.pack(side="right", padx=(0, 8), pady=4)
+        # _update_banner is *not* packed yet — _show_update_banner does that.
 
         top = ttk.LabelFrame(self.root, text="1. Ссылка на книгу")
         top.pack(fill="x", **pad)
@@ -1157,6 +1197,21 @@ class NovelDownloaderApp:
             self.progress.config(value=msg.current, maximum=msg.total)
             label = self._operation_label or "Прогресс"
             self.status_var.set(f"{label}: {msg.current}/{msg.total}")
+        elif isinstance(msg, _UpdateMsg):
+            # Pulled-back from the daemon update-check thread. If there
+            # are updates, show the banner; if we already showed it and
+            # the new status says "up to date", hide it.
+            if msg.status.has_updates:
+                self._show_update_banner(msg.status)
+            else:
+                try:
+                    self._update_banner.pack_forget()
+                except tk.TclError:
+                    pass
+                if msg.status.error:
+                    self._append_log(f"Update check: {msg.status.error}")
+                else:
+                    self._append_log("Update check: up to date.")
         elif isinstance(msg, _CharsMsg):
             # Char-based bar for translation: smooth motion even inside a
             # single 12000-character chapter that takes 30+ seconds.
@@ -1263,6 +1318,76 @@ class NovelDownloaderApp:
                 f"Файл лога:\n{path}\n\nОткрой его вручную — "
                 f"автоматически открыть не получилось.",
             )
+
+    # ---- update check --------------------------------------------------
+    def _repo_root(self) -> Path:
+        """Return the git repo root, derived from this file's location."""
+        # gui.py lives at <repo>/execution/novel_dl/gui.py.
+        return Path(__file__).resolve().parents[2]
+
+    def _update_check_worker(self) -> None:
+        try:
+            status = check_for_updates(self._repo_root(), do_fetch=True)
+        except Exception as exc:  # pragma: no cover — defensive
+            status = UpdateStatus(error=f"check failed: {exc}")
+        self._messages.put(_UpdateMsg(status=status))
+
+    def _show_update_banner(self, status: UpdateStatus) -> None:
+        if status.has_updates:
+            self._update_banner_label.config(
+                text=(
+                    f"Доступно обновление: {status.behind} "
+                    f"коммит(ов) на {status.upstream}. "
+                    f"({status.head_short} → {status.upstream_short})"
+                ),
+                foreground="#0078d7",
+            )
+            self._update_btn.config(state="normal")
+            self._update_banner.pack(
+                fill="x", side="top", before=self.root.winfo_children()[0],
+            )
+            self._append_log(
+                f"Update check: behind by {status.behind} commit(s) on "
+                f"{status.upstream}."
+            )
+        else:
+            # No updates and no error — keep the banner hidden. If
+            # there's an error, log it but don't pester the user with a
+            # red bar; they can see it in the log file if curious.
+            if status.error:
+                self._append_log(f"Update check: {status.error}")
+            else:
+                self._append_log(
+                    f"Update check: up to date ({status.head_short})."
+                )
+
+    def _on_update_pull(self) -> None:
+        """User clicked 'Обновить' — try a fast-forward pull."""
+        self._update_btn.config(state="disabled")
+        self._update_banner_label.config(
+            text="Обновляю…", foreground="#888888",
+        )
+
+        def worker() -> None:
+            ok, msg = fast_forward_pull(self._repo_root())
+            self._messages.put(_LogMsg(f"git pull: {msg}"))
+            if ok:
+                self._messages.put(_LogMsg(
+                    "Обновление применено. Перезапусти приложение, "
+                    "чтобы новый код вступил в силу."
+                ))
+            else:
+                self._messages.put(_LogMsg(
+                    "Обновление не удалось. Сделай pull вручную или "
+                    "запусти заново."
+                ))
+            # Refresh status so the banner either disappears (now
+            # up-to-date) or repaints with the remaining commits.
+            self._messages.put(_UpdateMsg(
+                status=check_for_updates(self._repo_root(), do_fetch=False),
+            ))
+
+        threading.Thread(target=worker, name="update-pull", daemon=True).start()
 
     # ---- theme ----------------------------------------------------------
     def _on_dark_mode_toggle(self) -> None:
