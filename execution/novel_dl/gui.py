@@ -214,6 +214,39 @@ class NovelDownloaderApp:
             row, foreground="#555",
             text="примеры: 1-50  •  500-  •  1,5,10-20  •  all",
         ).pack(side="left")
+        ttk.Button(
+            row, text="Обновить статусы",
+            command=self._refresh_chapter_status,
+        ).pack(side="right", padx=(0, 4))
+
+        # Per-chapter status grid: visible after a book has loaded. Shows
+        # which chapters are downloaded (.txt exists), translated (matching
+        # file in <out>/translated_ru/), and which packaged into the most
+        # recent EPUB. Clicking a row inserts the chapter number into the
+        # range field as a quick selection helper.
+        tree_frame = ttk.Frame(sel)
+        tree_frame.pack(fill="both", expand=False, padx=8, pady=(0, 6))
+        self.chapter_tree = ttk.Treeview(
+            tree_frame, columns=("num", "title", "dl", "tr"),
+            show="headings", height=8, selectmode="extended",
+        )
+        self.chapter_tree.heading("num", text="№")
+        self.chapter_tree.heading("title", text="Название")
+        self.chapter_tree.heading("dl", text="Скачано")
+        self.chapter_tree.heading("tr", text="Переведено")
+        self.chapter_tree.column("num", width=60, anchor="e", stretch=False)
+        self.chapter_tree.column("title", width=460, anchor="w")
+        self.chapter_tree.column("dl", width=80, anchor="center", stretch=False)
+        self.chapter_tree.column("tr", width=100, anchor="center", stretch=False)
+        self.chapter_tree.pack(side="left", fill="both", expand=True)
+        tree_sb = ttk.Scrollbar(
+            tree_frame, orient="vertical", command=self.chapter_tree.yview,
+        )
+        tree_sb.pack(side="right", fill="y")
+        self.chapter_tree.configure(yscrollcommand=tree_sb.set)
+        self.chapter_tree.bind(
+            "<Double-1>", self._on_chapter_tree_double_click,
+        )
 
         out = ttk.LabelFrame(self.root, text="4. Куда сохранять")
         out.pack(fill="x", **pad)
@@ -1130,6 +1163,7 @@ class NovelDownloaderApp:
             self.book_info_var.set("   •   ".join(bits))
             self.status_var.set(f"Готов к скачиванию. Глав: {total}.")
             self._append_log(f"ОК: {total} глав загружено из списка.")
+            self._populate_chapter_tree()
             self._set_state_ready()
         elif isinstance(msg, _DownloadDone):
             self._last_out_dir = msg.out_dir
@@ -1138,12 +1172,14 @@ class NovelDownloaderApp:
             self._append_log(f"Готово. Папка: {msg.out_dir}")
             if msg.combined_path is not None:
                 self._append_log(f"Файл combined: {msg.combined_path}")
+            self._refresh_chapter_status()
             self._set_state_ready()
             messagebox.showinfo("Готово",
                                 f"Скачано в:\n{msg.out_dir}")
         elif isinstance(msg, _TranslateDone):
             self.status_var.set("Перевод готов.")
             self._append_log(f"Переведено {msg.count} глав в {msg.out_dir}")
+            self._refresh_chapter_status()
             self._set_state_ready()
             messagebox.showinfo(
                 "Перевод готов",
@@ -1211,6 +1247,88 @@ class NovelDownloaderApp:
                 f"Файл лога:\n{path}\n\nОткрой его вручную — "
                 f"автоматически открыть не получилось.",
             )
+
+    # ---- chapter status tree -------------------------------------------
+    def _populate_chapter_tree(self) -> None:
+        """Fill the Treeview from ``self._book.chapters`` and refresh statuses.
+
+        Called once when a book finishes loading. After that the same
+        rows live as long as the book stays loaded; only the dl/tr
+        columns get updated (via ``_refresh_chapter_status``) when the
+        on-disk state changes.
+        """
+        for iid in self.chapter_tree.get_children():
+            self.chapter_tree.delete(iid)
+        if self._book is None:
+            return
+        for i, chapter in enumerate(self._book.chapters, start=1):
+            title = (chapter.title or f"Глава {i}").strip()
+            self.chapter_tree.insert(
+                "", "end", iid=str(i),
+                values=(i, title, "", ""),
+            )
+        self._refresh_chapter_status()
+
+    def _refresh_chapter_status(self) -> None:
+        """Re-scan disk and update the dl/tr columns for every chapter row.
+
+        Cheap enough (just two ``Path.exists`` per row) to call any time.
+        Triggered automatically after each successful download/translate
+        and manually by the toolbar button next to the range entry.
+        """
+        if self._book is None or not hasattr(self, "chapter_tree"):
+            return
+        out_root = Path(self.output_var.get() or "downloads")
+        slug = safe_filename(self._book.slug or self._book.title)
+        # Default download/translate locations. We trust the user's
+        # current "output_dir" field; if they had a different one when
+        # the data was actually written the indicators just won't match
+        # — and that's the right thing to do (different config, different
+        # state).
+        src_dir = out_root / slug
+        explicit_src = self.translate_src_var.get().strip()
+        if explicit_src and Path(explicit_src).exists():
+            src_dir = Path(explicit_src)
+        dst_dir = src_dir.parent / (src_dir.name + "_ru")
+
+        downloaded_nums = (
+            _chapter_numbers_in(src_dir) if src_dir.exists() else set()
+        )
+        translated_nums = (
+            _chapter_numbers_in(dst_dir) if dst_dir.exists() else set()
+        )
+
+        for i in range(1, len(self._book.chapters) + 1):
+            iid = str(i)
+            if not self.chapter_tree.exists(iid):
+                continue
+            current = self.chapter_tree.item(iid, "values")
+            self.chapter_tree.item(
+                iid,
+                values=(
+                    current[0],
+                    current[1],
+                    "✅" if i in downloaded_nums else "—",
+                    "✅" if i in translated_nums else "—",
+                ),
+            )
+
+    def _on_chapter_tree_double_click(self, _event: object) -> None:
+        """Double-click on a row → write that chapter's number into the range field.
+
+        Lets the user pick "translate just chapter 7" in two clicks
+        without having to type. Multi-select + double-click writes a
+        comma-separated list of the selected chapter numbers.
+        """
+        sel = self.chapter_tree.selection()
+        if not sel:
+            return
+        nums = sorted(int(iid) for iid in sel if iid.isdigit())
+        if not nums:
+            return
+        self.range_var.set(",".join(str(n) for n in nums))
+        self.translate_range_var.set(self.range_var.get())
+        self.epub_range_var.set(self.range_var.get())
 
     def _push_recent_url(self, url: str) -> None:
         url = (url or "").strip()
