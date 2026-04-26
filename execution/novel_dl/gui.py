@@ -301,26 +301,29 @@ class NovelDownloaderApp:
         ).pack(side="left", padx=(6, 0))
 
         # Pack bottom-up so progress + status + log always have guaranteed
-        # space at the bottom of the window, even when the translate panel
-        # above is expanded or the user has shrunk the window. Previously
-        # on 1366×768 laptops the log panel was pushed off-screen and the
-        # user couldn't see live translation progress.
-        log_frame = ttk.LabelFrame(self.root, text="Лог", height=180)
-        # pack_propagate(False) = don't shrink to fit children — respect
-        # the explicit height so the log never becomes 0px tall.
-        log_frame.pack_propagate(False)
+        # space at the bottom of the window. Use the Text widget's own
+        # height (in rows) instead of a pixel-based frame height — Tkinter
+        # respects rows reliably across DPI scales and themes, while pixel
+        # sizes on a ttk.LabelFrame sometimes collapse to one line.
         self.progress = ttk.Progressbar(self.root, mode="determinate")
         self.status_var = tk.StringVar(value="Готов.")
         self.status_label = ttk.Label(
             self.root, textvariable=self.status_var, anchor="w",
             wraplength=900, justify="left",
         )
-        # Order: progress (bottom), status (above progress), log (fills rest).
+        log_frame = ttk.LabelFrame(self.root, text="Лог")
+
+        # Order: progress (very bottom), status (above progress), log (above
+        # status, expands to fill the remaining vertical space).
         self.progress.pack(side="bottom", fill="x", padx=10, pady=(0, 4))
         self.status_label.pack(side="bottom", fill="x", padx=10, pady=(0, 2))
         log_frame.pack(side="bottom", fill="both", expand=True, **pad)
 
-        self.log = tk.Text(log_frame, wrap="word", state="disabled")
+        # height=15 rows ≈ 280px on default font — well above the "1 line"
+        # collapse the user reported.
+        self.log = tk.Text(
+            log_frame, wrap="word", state="disabled", height=15,
+        )
         self.log.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
         log_sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
         log_sb.pack(side="right", fill="y", pady=8, padx=(0, 8))
