@@ -1915,18 +1915,24 @@ class NovelDownloaderApp:
             _chapter_numbers_in(dst_dir) if dst_dir.exists() else set()
         )
 
-        for i in range(1, len(self._book.chapters) + 1):
+        for i, chapter in enumerate(self._book.chapters, start=1):
             iid = str(i)
             if not self.chapter_tree.exists(iid):
                 continue
             current = self.chapter_tree.item(iid, "values")
+            # File names use chapter.num when known, otherwise the 1-based
+            # row index — same rule as downloader._chapter_filename().
+            # Lining the lookup up with that rule keeps the dl/tr ticks
+            # accurate even when the source site numbers chapters
+            # non-contiguously (e.g. '0', '0.5', side-stories).
+            file_num = chapter.num if chapter.num is not None else i
             self.chapter_tree.item(
                 iid,
                 values=(
                     current[0],
                     current[1],
-                    "✅" if i in downloaded_nums else "—",
-                    "✅" if i in translated_nums else "—",
+                    "✅" if file_num in downloaded_nums else "—",
+                    "✅" if file_num in translated_nums else "—",
                 ),
             )
 
@@ -1938,9 +1944,22 @@ class NovelDownloaderApp:
         comma-separated list of the selected chapter numbers.
         """
         sel = self.chapter_tree.selection()
-        if not sel:
+        if not sel or self._book is None:
             return
-        nums = sorted(int(iid) for iid in sel if iid.isdigit())
+        # The iid is the 1-based row index; what we want in the range
+        # field is the actual chapter NUMBER on disk (chapter.num, with
+        # row-index fallback). Mixing these up made double-click write
+        # the wrong number for books whose first chapter isn't num=1.
+        chapters = self._book.chapters
+        nums: list[int] = []
+        for iid in sel:
+            if not iid.isdigit():
+                continue
+            row = int(iid)
+            if 1 <= row <= len(chapters):
+                ch = chapters[row - 1]
+                nums.append(ch.num if ch.num is not None else row)
+        nums = sorted(set(nums))
         if not nums:
             return
         self.range_var.set(",".join(str(n) for n in nums))
