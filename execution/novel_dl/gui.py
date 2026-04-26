@@ -29,6 +29,7 @@ from .backup import snapshot_dir
 from .core import Book, UnsupportedSiteError
 from .downloader import DownloadCancelled, DownloadError, download_chapters
 from .epub import build_epub_from_folder
+from .glossary import load_glossary, save_glossary
 from .registry import get_adapter
 from .runlog import RunLog, open_in_system_editor, prune_old_logs
 from .settings import load_settings, push_recent, save_settings
@@ -168,6 +169,13 @@ class NovelDownloaderApp:
         # the same atomic save_settings call as everything else.
         self._recent_urls: list[str] = []
         self._recent_api_keys: list[str] = []
+        # Per-book glossary, loaded fresh whenever a book finishes
+        # loading. Pairs are (src, dst) — src is the term in the source
+        # language, dst is what the translator must output. Lives in
+        # ``~/.novel_dl/glossary/<slug>.json`` so different novels keep
+        # separate name dictionaries.
+        self._glossary: list[tuple[str, str]] = []
+        self._glossary_slug: str | None = None
 
         # Debounce token for autosave-on-change. tkinter "after" returns
         # an id we can cancel so multiple keystrokes coalesce into one
@@ -411,6 +419,46 @@ class NovelDownloaderApp:
             tr_range_row, foreground="#555",
             text="номера глав: 3-200  •  3,5,10-20  •  all",
         ).pack(side="left")
+
+        # Glossary editor — per-book terms the translator must respect.
+        # Loaded automatically when the book is loaded; persists to
+        # ``~/.novel_dl/glossary/<slug>.json``. Living inside the
+        # translation frame keeps the translator's knobs in one place.
+        gloss_frame = ttk.LabelFrame(tr, text="Глоссарий (исправляет дрейф имён между главами)")
+        gloss_frame.pack(fill="x", padx=8, pady=(4, 4))
+        gloss_top = ttk.Frame(gloss_frame)
+        gloss_top.pack(fill="x", padx=4, pady=(4, 2))
+        ttk.Label(
+            gloss_top, foreground="#555",
+            text="двойной клик по строке — изменить; добавляй имена/термины которые модель путает",
+        ).pack(side="left")
+        ttk.Button(
+            gloss_top, text="+ Добавить", command=self._on_glossary_add,
+        ).pack(side="right", padx=(4, 0))
+        ttk.Button(
+            gloss_top, text="− Удалить", command=self._on_glossary_delete,
+        ).pack(side="right", padx=(4, 0))
+
+        gloss_tree_frame = ttk.Frame(gloss_frame)
+        gloss_tree_frame.pack(fill="x", padx=4, pady=(0, 4))
+        self.glossary_tree = ttk.Treeview(
+            gloss_tree_frame, columns=("src", "dst"),
+            show="headings", height=4, selectmode="extended",
+        )
+        self.glossary_tree.heading("src", text="Source (en)")
+        self.glossary_tree.heading("dst", text="Перевод (ru)")
+        self.glossary_tree.column("src", width=260, anchor="w")
+        self.glossary_tree.column("dst", width=260, anchor="w")
+        self.glossary_tree.pack(side="left", fill="x", expand=True)
+        gloss_sb = ttk.Scrollbar(
+            gloss_tree_frame, orient="vertical",
+            command=self.glossary_tree.yview,
+        )
+        gloss_sb.pack(side="right", fill="y")
+        self.glossary_tree.configure(yscrollcommand=gloss_sb.set)
+        self.glossary_tree.bind(
+            "<Double-1>", self._on_glossary_double_click,
+        )
 
         tr_btns = ttk.Frame(tr)
         tr_btns.pack(fill="x", padx=8, pady=(2, 4))
@@ -867,7 +915,10 @@ class NovelDownloaderApp:
             return
 
         dst_dir = src_dir.parent / (src_dir.name + "_ru")
-        cfg = TranslatorConfig(api_key=api_key, model=model, system_prompt=prompt)
+        cfg = TranslatorConfig(
+            api_key=api_key, model=model, system_prompt=prompt,
+            glossary=list(self._glossary),
+        )
 
         available_nums = sorted(_chapter_numbers_in(src_dir))
         if not available_nums:
@@ -1235,6 +1286,8 @@ class NovelDownloaderApp:
             self.status_var.set(f"Готов к скачиванию. Глав: {total}.")
             self._append_log(f"ОК: {total} глав загружено из списка.")
             self._populate_chapter_tree()
+            slug = msg.book.slug or safe_filename(msg.book.title or "book")
+            self._load_glossary_for_book(slug)
             self._set_state_ready()
         elif isinstance(msg, _DownloadDone):
             self._last_out_dir = msg.out_dir
@@ -1533,6 +1586,145 @@ class NovelDownloaderApp:
         self.root.option_add(
             "*TCombobox*Listbox.selectForeground", palette["select_fg"],
         )
+
+    # ---- glossary ------------------------------------------------------
+    def _refresh_glossary_tree(self) -> None:
+        """Repopulate the glossary Treeview from ``self._glossary``."""
+        if not hasattr(self, "glossary_tree"):
+            return
+        for iid in self.glossary_tree.get_children():
+            self.glossary_tree.delete(iid)
+        for i, (src, dst) in enumerate(self._glossary):
+            self.glossary_tree.insert(
+                "", "end", iid=str(i), values=(src, dst),
+            )
+
+    def _persist_glossary(self) -> None:
+        """Save the in-memory glossary to disk for the current book.
+
+        Called after every add/edit/delete so the user never has to hit
+        a Save button. No-op when no book is loaded yet — the slug is
+        the filename and we have no way to disambiguate without one.
+        """
+        if not self._glossary_slug:
+            return
+        try:
+            save_glossary(self._glossary_slug, self._glossary)
+        except OSError as exc:
+            self._append_log(f"Не удалось сохранить глоссарий: {exc}")
+
+    def _load_glossary_for_book(self, slug: str) -> None:
+        self._glossary_slug = slug
+        try:
+            self._glossary = load_glossary(slug)
+        except Exception as exc:  # pragma: no cover — defensive
+            self._glossary = []
+            self._append_log(f"Не удалось загрузить глоссарий: {exc}")
+        self._refresh_glossary_tree()
+        if self._glossary:
+            self._append_log(
+                f"Глоссарий ({len(self._glossary)} записей) загружен "
+                f"для книги «{slug}»."
+            )
+
+    def _prompt_glossary_pair(
+        self, initial: tuple[str, str] = ("", ""),
+    ) -> tuple[str, str] | None:
+        """Pop a small modal asking for src + dst. Returns None on cancel."""
+        win = tk.Toplevel(self.root)
+        win.title("Запись глоссария")
+        win.transient(self.root)
+        win.grab_set()
+        win.resizable(False, False)
+        result: dict[str, tuple[str, str] | None] = {"value": None}
+
+        ttk.Label(win, text="Source (en):").grid(
+            row=0, column=0, padx=8, pady=(8, 4), sticky="w",
+        )
+        src_var = tk.StringVar(value=initial[0])
+        src_entry = ttk.Entry(win, textvariable=src_var, width=40)
+        src_entry.grid(row=0, column=1, padx=8, pady=(8, 4))
+
+        ttk.Label(win, text="Перевод (ru):").grid(
+            row=1, column=0, padx=8, pady=4, sticky="w",
+        )
+        dst_var = tk.StringVar(value=initial[1])
+        dst_entry = ttk.Entry(win, textvariable=dst_var, width=40)
+        dst_entry.grid(row=1, column=1, padx=8, pady=4)
+
+        btn_row = ttk.Frame(win)
+        btn_row.grid(row=2, column=0, columnspan=2, pady=(8, 8))
+
+        def ok() -> None:
+            s = src_var.get().strip()
+            d = dst_var.get().strip()
+            if not s or not d:
+                messagebox.showwarning(
+                    "Глоссарий",
+                    "Оба поля обязательны.",
+                    parent=win,
+                )
+                return
+            result["value"] = (s, d)
+            win.destroy()
+
+        def cancel() -> None:
+            win.destroy()
+
+        ttk.Button(btn_row, text="OK", command=ok).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Отмена", command=cancel).pack(side="left", padx=4)
+        win.bind("<Return>", lambda _e: ok())
+        win.bind("<Escape>", lambda _e: cancel())
+        src_entry.focus_set()
+        win.wait_window()
+        return result["value"]
+
+    def _on_glossary_add(self) -> None:
+        if not self._glossary_slug:
+            messagebox.showinfo(
+                "Глоссарий",
+                "Сначала загрузи книгу — глоссарий привязан к её slug.",
+            )
+            return
+        pair = self._prompt_glossary_pair()
+        if pair is None:
+            return
+        # Replace existing src match (case-sensitive) so the user can't
+        # accidentally produce two entries for the same term.
+        self._glossary = [
+            (s, d) for (s, d) in self._glossary if s != pair[0]
+        ]
+        self._glossary.append(pair)
+        self._refresh_glossary_tree()
+        self._persist_glossary()
+
+    def _on_glossary_delete(self) -> None:
+        sel = self.glossary_tree.selection()
+        if not sel:
+            return
+        indexes = sorted((int(iid) for iid in sel if iid.isdigit()), reverse=True)
+        for idx in indexes:
+            if 0 <= idx < len(self._glossary):
+                del self._glossary[idx]
+        self._refresh_glossary_tree()
+        self._persist_glossary()
+
+    def _on_glossary_double_click(self, _event: object) -> None:
+        sel = self.glossary_tree.selection()
+        if not sel:
+            return
+        try:
+            idx = int(sel[0])
+        except ValueError:
+            return
+        if not (0 <= idx < len(self._glossary)):
+            return
+        pair = self._prompt_glossary_pair(self._glossary[idx])
+        if pair is None:
+            return
+        self._glossary[idx] = pair
+        self._refresh_glossary_tree()
+        self._persist_glossary()
 
     # ---- chapter status tree -------------------------------------------
     def _populate_chapter_tree(self) -> None:

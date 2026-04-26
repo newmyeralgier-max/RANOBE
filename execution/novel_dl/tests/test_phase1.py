@@ -20,8 +20,18 @@ if str(EXECUTION_DIR) not in sys.path:
 
 from novel_dl import settings as settings_mod  # noqa: E402
 from novel_dl.backup import snapshot_dir  # noqa: E402
+from novel_dl.glossary import (  # noqa: E402
+    format_glossary_for_prompt,
+    glossary_path_for,
+    load_glossary,
+    save_glossary,
+)
 from novel_dl.runlog import RunLog, prune_old_logs  # noqa: E402
 from novel_dl.settings import push_recent  # noqa: E402
+from novel_dl.translator import (  # noqa: E402
+    TranslatorConfig,
+    _system_prompt_with_glossary,
+)
 from novel_dl.update_check import (  # noqa: E402
     UpdateStatus,
     check_for_updates,
@@ -214,6 +224,58 @@ def test_update_status_has_updates_property():
     assert UpdateStatus(behind=2).has_updates is True
     assert UpdateStatus(behind=0).has_updates is False
     assert UpdateStatus(behind=5, error="boom").has_updates is False
+
+
+def test_glossary_round_trip(tmp_path, monkeypatch):
+    import novel_dl.glossary as gloss_mod
+    monkeypatch.setattr(gloss_mod, "GLOSSARY_DIR", tmp_path / "g")
+    pairs = [("John", "Джон"), ("Sword Saint", "Святой Меча")]
+    save_glossary("test-book", pairs)
+    assert load_glossary("test-book") == pairs
+
+
+def test_glossary_missing_file_returns_empty(tmp_path, monkeypatch):
+    import novel_dl.glossary as gloss_mod
+    monkeypatch.setattr(gloss_mod, "GLOSSARY_DIR", tmp_path / "g")
+    assert load_glossary("does-not-exist") == []
+
+
+def test_glossary_path_safe_for_weird_slugs(tmp_path, monkeypatch):
+    import novel_dl.glossary as gloss_mod
+    monkeypatch.setattr(gloss_mod, "GLOSSARY_DIR", tmp_path / "g")
+    p = glossary_path_for("../../etc/passwd")
+    # Sanitiser must collapse path-traversal characters.
+    assert ".." not in p.name
+    assert "/" not in p.name
+
+
+def test_glossary_format_empty_returns_empty_string():
+    assert format_glossary_for_prompt([]) == ""
+
+
+def test_glossary_format_renders_pairs():
+    out = format_glossary_for_prompt([("John", "Джон"), ("Saint", "Святой")])
+    assert "John" in out and "Джон" in out
+    assert "Saint" in out and "Святой" in out
+    # Header should be present so the model treats the list as
+    # instructions, not as example output.
+    assert "Глоссарий" in out
+
+
+def test_translator_appends_glossary_to_system_prompt():
+    cfg = TranslatorConfig(
+        api_key="x", model="m",
+        system_prompt="Ты переводчик.",
+        glossary=[("John", "Джон")],
+    )
+    full = _system_prompt_with_glossary(cfg)
+    assert full.startswith("Ты переводчик.")
+    assert "John" in full and "Джон" in full
+
+
+def test_translator_no_glossary_keeps_prompt_unchanged():
+    cfg = TranslatorConfig(api_key="x", model="m", system_prompt="P")
+    assert _system_prompt_with_glossary(cfg) == "P"
 
 
 def test_snapshot_prunes_excess_backups(tmp_path):

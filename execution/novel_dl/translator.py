@@ -18,11 +18,29 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from .glossary import format_glossary_for_prompt
 from .utils import wait_if_paused
+
+
+def _system_prompt_with_glossary(cfg: "TranslatorConfig") -> str:
+    """Splice the glossary fragment after the user's system prompt.
+
+    Glossary goes AFTER the user's prompt so user customisation still
+    sets the overall style/voice; the glossary then constrains specific
+    terms inside that voice. Empty glossary returns the user's prompt
+    unchanged so we don't add an empty paragraph that wastes tokens.
+    """
+    base = cfg.system_prompt or ""
+    fragment = format_glossary_for_prompt(cfg.glossary)
+    if not fragment:
+        return base
+    if not base:
+        return fragment
+    return f"{base}\n\n{fragment}"
 
 DEFAULT_COHERE_MODEL = "command-a-03-2025"
 COHERE_CHAT_URL = "https://api.cohere.com/v2/chat"
@@ -69,6 +87,12 @@ class TranslatorConfig:
     retries: int = 3
     retry_backoff: float = 3.0
     temperature: float = DEFAULT_TEMPERATURE
+    # Phase 3: per-book glossary of fixed translations. Pairs are
+    # (source-language term, target-language rendering). Joined into
+    # the system prompt at request time so the model can't drift
+    # between Джон / Иван / Юджин for the same character across
+    # chapters. Empty list ⇒ no glossary fragment is appended.
+    glossary: "list[tuple[str, str]]" = field(default_factory=list)
 
 
 def _wrap_for_translation(text: str) -> str:
@@ -237,7 +261,7 @@ def translate_text(
         body = {
             "model": cfg.model,
             "messages": [
-                {"role": "system", "content": cfg.system_prompt},
+                {"role": "system", "content": _system_prompt_with_glossary(cfg)},
                 {"role": "user", "content": _wrap_for_translation(text)},
             ],
             "temperature": temp,
