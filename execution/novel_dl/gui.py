@@ -28,7 +28,7 @@ from typing import Callable
 from .backup import snapshot_dir
 from .core import Book, UnsupportedSiteError
 from .downloader import DownloadCancelled, DownloadError, download_chapters
-from .epub import build_epub_from_folder
+from .epub import build_bilingual_epub_from_folders, build_epub_from_folder
 from .glossary import load_glossary, save_glossary
 from .registry import get_adapter
 from .runlog import RunLog, open_in_system_editor, prune_old_logs
@@ -338,6 +338,31 @@ class NovelDownloaderApp:
 
         tr = ttk.LabelFrame(self.root, text="5. Перевод (Cohere)")
         tr.pack(fill="x", **pad)
+        # Provider selector. Right now only Cohere is wired through to
+        # the actual translator; the rest are visible-but-disabled stubs
+        # so the UI shows users what's planned without giving them a
+        # broken option to click. When we add a real provider we just
+        # remove the "future" tag from its label and add a branch in
+        # _on_translate.
+        provider_row = ttk.Frame(tr)
+        provider_row.pack(fill="x", padx=8, pady=(8, 2))
+        ttk.Label(provider_row, text="Провайдер:").pack(side="left")
+        self.provider_var = tk.StringVar(value="Cohere (command-a)")
+        provider_combo = ttk.Combobox(
+            provider_row, textvariable=self.provider_var,
+            state="readonly", height=5,
+            values=(
+                "Cohere (command-a)",
+                "OpenAI (на будущее)",
+                "Anthropic (на будущее)",
+                "DeepSeek (на будущее)",
+            ),
+        )
+        provider_combo.pack(side="left", padx=(6, 0))
+        provider_combo.bind(
+            "<<ComboboxSelected>>", self._on_provider_changed,
+        )
+
         key_row = ttk.Frame(tr)
         key_row.pack(fill="x", padx=8, pady=(8, 2))
         ttk.Label(key_row, text="API-ключ:").pack(side="left")
@@ -501,6 +526,25 @@ class NovelDownloaderApp:
             epub_row, foreground="#555",
             text="напр. 3-200 или all",
         ).pack(side="left", padx=(6, 0))
+
+        # Phase 3.4: bilingual EPUB. User explicitly asked for a
+        # SEPARATE prominent checkbox so it doesn't interfere with the
+        # default flow. Wrapped in its own LabelFrame with a coloured
+        # title so it visually stands out from the regular epub row.
+        bi_frame = ttk.LabelFrame(
+            tr,
+            text="📚 Двуязычный EPUB (английский + русский для изучения языка)",
+        )
+        bi_frame.pack(fill="x", padx=8, pady=(0, 8))
+        self.bilingual_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            bi_frame,
+            text=(
+                "Включить — собрать EPUB где после каждого английского "
+                "абзаца идёт русский (вместо обычного однолингвального)"
+            ),
+            variable=self.bilingual_var,
+        ).pack(side="left", padx=8, pady=4)
 
         # Pack bottom-up so progress + status + log always have guaranteed
         # space at the bottom of the window. Use the Text widget's own
@@ -987,16 +1031,40 @@ class NovelDownloaderApp:
                 "Сначала скачай (и при желании переведи) главы.",
             )
             return
-        use_ru = self.epub_source_var.get().startswith("ru")
-        src_dir = raw_dir.parent / (raw_dir.name + "_ru") if use_ru else raw_dir
-        if not src_dir.exists() or not any(src_dir.glob("chapter_*.txt")):
-            missing = "переведённых" if use_ru else "скачанных"
-            messagebox.showwarning(
-                "Нет данных",
-                f"В папке {src_dir} нет {missing} глав. "
-                f"Сначала {'переведи' if use_ru else 'скачай'}.",
-            )
-            return
+        bilingual = bool(self.bilingual_var.get())
+        ru_dir = raw_dir.parent / (raw_dir.name + "_ru")
+        if bilingual:
+            # Bilingual mode needs BOTH the english source dir and the
+            # russian translation dir to exist. We compute the chapter
+            # range against the russian dir (translation is the bottle-
+            # neck — if a chapter isn't translated yet, we can't bind
+            # it bilingually) and pass both to the builder.
+            if not ru_dir.exists() or not any(ru_dir.glob("chapter_*.txt")):
+                messagebox.showwarning(
+                    "Нет данных для двуязычного EPUB",
+                    "В папке "
+                    f"{ru_dir} нет переведённых глав. Сначала переведи.",
+                )
+                return
+            if not any(raw_dir.glob("chapter_*.txt")):
+                messagebox.showwarning(
+                    "Нет данных для двуязычного EPUB",
+                    f"В папке {raw_dir} нет английских глав.",
+                )
+                return
+            src_dir = ru_dir  # used only for chapter-number range parsing
+            use_ru = True
+        else:
+            use_ru = self.epub_source_var.get().startswith("ru")
+            src_dir = ru_dir if use_ru else raw_dir
+            if not src_dir.exists() or not any(src_dir.glob("chapter_*.txt")):
+                missing = "переведённых" if use_ru else "скачанных"
+                messagebox.showwarning(
+                    "Нет данных",
+                    f"В папке {src_dir} нет {missing} глав. "
+                    f"Сначала {'переведи' if use_ru else 'скачай'}.",
+                )
+                return
 
         available_nums = sorted(_chapter_numbers_in(src_dir))
         wanted = _parse_chapter_number_spec(
@@ -1020,7 +1088,9 @@ class NovelDownloaderApp:
         title = (self._book.title if self._book else raw_dir.name) or raw_dir.name
         author = (self._book.author if self._book else "") or ""
         suffix_bits: list[str] = []
-        if use_ru:
+        if bilingual:
+            suffix_bits.append("EN+RU")
+        elif use_ru:
             suffix_bits.append("перевод")
         if wanted != set(available_nums):
             lo, hi = min(wanted), max(wanted)
@@ -1046,9 +1116,14 @@ class NovelDownloaderApp:
         if snap is not None:
             self._append_log(f"Бэкап перед сборкой EPUB: {snap}")
         self._save_current_settings()
-        self._spawn(lambda: self._worker_build_epub(
-            src_dir, epub_path, title, author, wanted,
-        ))
+        if bilingual:
+            self._spawn(lambda: self._worker_build_bilingual_epub(
+                raw_dir, ru_dir, epub_path, title, author, wanted,
+            ))
+        else:
+            self._spawn(lambda: self._worker_build_epub(
+                src_dir, epub_path, title, author, wanted,
+            ))
 
     def _on_open_folder(self) -> None:
         if not self._last_out_dir or not self._last_out_dir.exists():
@@ -1235,6 +1310,23 @@ class NovelDownloaderApp:
             )
         except Exception as exc:  # pragma: no cover
             self._messages.put(_Error(f"Не удалось собрать EPUB: {exc}"))
+            return
+        self._messages.put(_EpubDone(epub_path=epub_path))
+
+    def _worker_build_bilingual_epub(
+        self, en_dir: Path, ru_dir: Path, epub_path: Path,
+        title: str, author: str, wanted: set[int],
+    ) -> None:
+        try:
+            build_bilingual_epub_from_folders(
+                en_dir, ru_dir, epub_path,
+                book_title=title, author=author,
+                wanted_numbers=wanted,
+            )
+        except Exception as exc:  # pragma: no cover
+            self._messages.put(_Error(
+                f"Не удалось собрать двуязычный EPUB: {exc}"
+            ))
             return
         self._messages.put(_EpubDone(epub_path=epub_path))
 
@@ -1599,6 +1691,26 @@ class NovelDownloaderApp:
         self.root.option_add(
             "*TCombobox*Listbox.selectForeground", palette["select_fg"],
         )
+
+    # ---- provider stub -------------------------------------------------
+    def _on_provider_changed(self, _event: object) -> None:
+        """Bounce non-Cohere choices back to Cohere with a friendly note.
+
+        We deliberately keep the other providers visible in the dropdown
+        (instead of hiding them) so the user knows what's planned —
+        clicking one just snaps back to Cohere with a 'coming soon'
+        toast. When OpenAI/Anthropic/DeepSeek get real implementations
+        this method either gets removed or grows real branches.
+        """
+        choice = self.provider_var.get()
+        if choice.startswith("Cohere"):
+            return
+        messagebox.showinfo(
+            "Провайдер",
+            f"{choice} — пока в планах. Сейчас работает только Cohere "
+            "(command-a). Возвращаю выбор обратно.",
+        )
+        self.provider_var.set("Cohere (command-a)")
 
     # ---- glossary ------------------------------------------------------
     def _refresh_glossary_tree(self) -> None:

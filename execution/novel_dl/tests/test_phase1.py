@@ -13,6 +13,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 HERE = Path(__file__).resolve()
 EXECUTION_DIR = HERE.parents[2]
 if str(EXECUTION_DIR) not in sys.path:
@@ -357,6 +359,63 @@ def test_translate_folder_threads_context_between_chapters(tmp_path, monkeypatch
     assert any("Second body para." in c for c in body_contexts), (
         f"expected ch1 tail in ch2 context; saw {seen_contexts!r}"
     )
+
+
+def test_bilingual_epub_pairs_chapters_by_number(tmp_path):
+    import zipfile
+
+    from novel_dl.epub import build_bilingual_epub_from_folders
+
+    en = tmp_path / "en"
+    ru = tmp_path / "ru"
+    en.mkdir()
+    ru.mkdir()
+    (en / "chapter_0001_a.txt").write_text(
+        "# Title One\n\nHello world.\n\nSecond para.\n",
+        encoding="utf-8",
+    )
+    (en / "chapter_0002_b.txt").write_text(
+        "# Title Two\n\nMore english.\n",
+        encoding="utf-8",
+    )
+    (ru / "chapter_0001_a.txt").write_text(
+        "# Заголовок Один\n\nПривет мир.\n\nВторой абзац.\n",
+        encoding="utf-8",
+    )
+    # Chapter 2 in russian deliberately missing — only ch1 has both.
+    out = tmp_path / "bilingual.epub"
+    build_bilingual_epub_from_folders(
+        en, ru, out, book_title="Test", author="A",
+    )
+    assert out.exists()
+    with zipfile.ZipFile(out, "r") as zf:
+        names = zf.namelist()
+        # mimetype first; only ONE chapter file (ch0001) since only
+        # chapter 1 had both english and russian sources.
+        assert names[0] == "mimetype"
+        chs = [n for n in names if n.startswith("OEBPS/ch") and n.endswith(".xhtml")]
+        assert chs == ["OEBPS/ch0001.xhtml"]
+        body = zf.read("OEBPS/ch0001.xhtml").decode("utf-8")
+        assert "Hello world." in body
+        assert "Привет мир." in body
+        # English paragraph should appear before russian paragraph.
+        assert body.index("Hello world.") < body.index("Привет мир.")
+        assert 'class="bi-en"' in body and 'class="bi-ru"' in body
+
+
+def test_bilingual_epub_raises_when_no_overlap(tmp_path):
+    from novel_dl.epub import build_bilingual_epub_from_folders
+
+    en = tmp_path / "en"
+    ru = tmp_path / "ru"
+    en.mkdir()
+    ru.mkdir()
+    (en / "chapter_0001_a.txt").write_text("# A\n\nbody\n", encoding="utf-8")
+    (ru / "chapter_0007_q.txt").write_text("# Б\n\nтело\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="и английская, и русская"):
+        build_bilingual_epub_from_folders(
+            en, ru, tmp_path / "x.epub", book_title="x",
+        )
 
 
 def test_translate_folder_skips_context_when_disabled(tmp_path, monkeypatch):
