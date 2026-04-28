@@ -245,6 +245,15 @@ class NovelDownloaderApp:
         self.load_btn = ttk.Button(top, text="Загрузить список глав",
                                    command=self._on_load_book)
         self.load_btn.pack(side="right", padx=(0, 8), pady=8)
+        # Phase 5: import a local file (.txt/.epub/.fb2) instead of
+        # scraping a site. Same downstream UI: chapter tree, translate,
+        # EPUB. Sits next to the "Load" button so users see it as a
+        # peer alternative — "если книги нет на сайте, открой файл".
+        self.import_btn = ttk.Button(
+            top, text="Импорт файла…",
+            command=self._on_import_file,
+        )
+        self.import_btn.pack(side="right", padx=(0, 4), pady=8)
 
         info = ttk.LabelFrame(self.root, text="2. Книга")
         info.pack(fill="x", **pad)
@@ -707,6 +716,84 @@ class NovelDownloaderApp:
         self._save_current_settings()
         cancel_event = self._cancel_event
         self._spawn(lambda: self._worker_fetch_book(url, cancel_event))
+
+    def _on_import_file(self) -> None:
+        """Pick a local .txt/.epub/.fb2 and load it as if it were a scraped book.
+
+        Imported books skip the network entirely — chapters are written
+        straight to ``<output_dir>/<slug>/chapter_NNNN.txt`` and the
+        usual chapter list / status ticks light up. From the user's
+        point of view, "Перевести скачанные" then works the same way
+        as on a real download.
+        """
+        from .importer import LocalImportError, import_local_file
+
+        chosen = filedialog.askopenfilename(
+            title="Импорт локальной книги",
+            filetypes=[
+                ("Все поддерживаемые", "*.txt *.epub *.fb2"),
+                ("Текст", "*.txt"),
+                ("EPUB", "*.epub"),
+                ("FB2", "*.fb2"),
+                ("Все файлы", "*.*"),
+            ],
+        )
+        if not chosen:
+            return
+        src = Path(chosen)
+
+        # Resolve target directory exactly like the downloader does:
+        # <output_dir>/<slug>. Falling back to a sibling of the input
+        # file when the user hasn't picked an output dir keeps the
+        # importer usable without prior config.
+        out_root = self.output_var.get().strip()
+        if not out_root:
+            out_root = str(src.parent / "novel_dl_out")
+            self.output_var.set(out_root)
+        slug = safe_filename(src.stem)
+        out_dir = Path(out_root) / slug
+
+        try:
+            book = import_local_file(src, out_dir)
+        except LocalImportError as exc:
+            messagebox.showerror("Импорт не удался", str(exc))
+            return
+        except Exception as exc:  # pragma: no cover - defensive
+            messagebox.showerror(
+                "Импорт упал",
+                f"Не смог разобрать {src.name}: {exc}",
+            )
+            return
+
+        # Treat the import as a successful "load + download" in one
+        # shot: book is set, chapters are on disk, status ticks should
+        # show ✅ in the dl column right away.
+        self._adapter = None
+        self._book = book
+        self._last_out_dir = out_dir
+        self.open_btn.config(state="normal")
+        self.book_title_var.set(book.title or src.stem)
+        self.book_info_var.set(
+            f"Глав: {len(book.chapters)}   •   Источник: {src.name}"
+        )
+        self._populate_chapter_tree()
+        self._load_glossary_for_book(slug)
+        self._refresh_chapter_status()
+        self._set_state_ready()
+        # Download button doesn't make sense for imports — there's
+        # nothing to fetch — but disabling it permanently is too
+        # aggressive (user might load a real URL next). Just show a
+        # message in the log.
+        self._append_log(
+            f"Импорт OK: {len(book.chapters)} глав из {src.name} в {out_dir}"
+        )
+        self.status_var.set(
+            f"Импорт готов. Глав: {len(book.chapters)}. "
+            f"Можно сразу нажимать «Перевести скачанные»."
+        )
+        # Pre-fill the translate-source box for the user so the next
+        # click is one less step.
+        self.translate_src_var.set(str(out_dir))
 
     def _on_pick_dir(self) -> None:
         chosen = filedialog.askdirectory(initialdir=self.output_var.get() or str(Path.cwd()))

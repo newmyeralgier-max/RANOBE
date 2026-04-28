@@ -1229,3 +1229,296 @@ def test_translate_folder_parallel_falls_back_to_serial_when_context_on(
     assert in_flight["peak"] == 1, (
         f"expected serial translate when context on, peak was {in_flight['peak']}"
     )
+
+
+# ---- Phase 5: local file importer ----------------------------------------
+
+def test_importer_txt_with_chapter_headings(tmp_path):
+    """Heuristic split on 'Chapter N' / 'Глава N' / Markdown H1."""
+    from novel_dl.importer import import_local_file
+
+    src = tmp_path / "novel.txt"
+    src.write_text(
+        "# Глава 1: Начало\n\n"
+        "Тёмной ночью.\n\n"
+        "Chapter 2 - Action\n\n"
+        "Боевая сцена.\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out"
+    book = import_local_file(src, out)
+    assert len(book.chapters) == 2
+    files = sorted(out.glob("chapter_*.txt"))
+    assert len(files) == 2
+    assert (out / "meta.json").exists()
+
+
+def test_importer_txt_no_headings_single_chapter(tmp_path):
+    """Files without obvious chapter cues should still import as 1 chapter."""
+    from novel_dl.importer import import_local_file
+
+    src = tmp_path / "blob.txt"
+    src.write_text("Just a long blob of plain prose.\n" * 20, encoding="utf-8")
+    book = import_local_file(src, tmp_path / "out")
+    assert len(book.chapters) == 1
+    assert "blob of plain prose" in (book.chapters[0].text or "")
+
+
+def test_importer_rejects_unknown_extension(tmp_path):
+    """Anything that isn't .txt/.epub/.fb2 should error with a clear message."""
+    from novel_dl.importer import LocalImportError, import_local_file
+
+    src = tmp_path / "thing.docx"
+    src.write_text("anything", encoding="utf-8")
+    try:
+        import_local_file(src, tmp_path / "out")
+    except LocalImportError as exc:
+        assert ".docx" in str(exc) or ".txt" in str(exc)
+        return
+    raise AssertionError("expected LocalImportError on .docx input")
+
+
+def test_importer_epub_basic(tmp_path):
+    """Build a minimal valid EPUB on the fly and assert chapters round-trip."""
+    import zipfile
+
+    from novel_dl.importer import import_local_file
+
+    src = tmp_path / "tiny.epub"
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("mimetype", "application/epub+zip")
+        zf.writestr(
+            "META-INF/container.xml",
+            '<?xml version="1.0"?><container><rootfiles>'
+            '<rootfile full-path="OEBPS/content.opf" '
+            'media-type="application/oebps-package+xml"/></rootfiles>'
+            '</container>',
+        )
+        zf.writestr(
+            "OEBPS/content.opf",
+            '<package><manifest>'
+            '<item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>'
+            '<item id="ch2" href="ch2.xhtml" media-type="application/xhtml+xml"/>'
+            '</manifest><spine>'
+            '<itemref idref="ch1"/><itemref idref="ch2"/>'
+            '</spine></package>',
+        )
+        zf.writestr(
+            "OEBPS/ch1.xhtml",
+            "<html><body><h1>Prologue</h1><p>It begins here.</p></body></html>",
+        )
+        zf.writestr(
+            "OEBPS/ch2.xhtml",
+            "<html><body><h1>The End</h1><p>And then it ended.</p></body></html>",
+        )
+
+    book = import_local_file(src, tmp_path / "out")
+    assert len(book.chapters) == 2
+    assert book.chapters[0].title == "Prologue"
+    assert "begins here" in (book.chapters[0].text or "")
+    assert book.chapters[1].title == "The End"
+
+
+def test_importer_fb2_basic(tmp_path):
+    """FB2 = XML; <section>/<title> structure should yield one chapter each."""
+    from novel_dl.importer import import_local_file
+
+    src = tmp_path / "novel.fb2"
+    src.write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<FictionBook>'
+        '<body>'
+        '<section><title><p>Глава 1</p></title>'
+        '<p>Первый абзац.</p><p>Второй абзац.</p></section>'
+        '<section><title><p>Глава 2</p></title>'
+        '<p>Третий абзац.</p></section>'
+        '</body></FictionBook>',
+        encoding="utf-8",
+    )
+    book = import_local_file(src, tmp_path / "out")
+    assert len(book.chapters) == 2
+    assert "Первый абзац" in (book.chapters[0].text or "")
+
+
+# ---- Phase 5: fetch_html retry semantics ---------------------------------
+
+def test_fetch_html_does_not_retry_permanent_4xx(monkeypatch):
+    """HTTP 404 should fail fast with FetchError, no retries."""
+    import urllib.error
+
+    from novel_dl import utils as utils_mod
+
+    calls = {"n": 0}
+
+    class _FakeResp:
+        pass
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        raise urllib.error.HTTPError(
+            req.full_url, 404, "Not Found", {}, None,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(utils_mod.urllib.request, "urlopen", fake_urlopen)
+    try:
+        utils_mod.fetch_html("https://x/missing", retries=3, backoff=0)
+    except utils_mod.FetchError as exc:
+        assert "404" in str(exc)
+        assert calls["n"] == 1, "404 should NOT be retried"
+        return
+    raise AssertionError("expected FetchError on 404")
+
+
+def test_fetch_html_retries_429_then_succeeds(monkeypatch):
+    """HTTP 429 (rate limit) is transient — retry until 200."""
+    import io
+    import urllib.error
+
+    from novel_dl import utils as utils_mod
+
+    calls = {"n": 0}
+
+    class _OkResp:
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return self._body
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise urllib.error.HTTPError(
+                req.full_url, 429, "Too Many Requests", {}, None,  # type: ignore[arg-type]
+            )
+        return _OkResp(b"<html>ok</html>")
+
+    monkeypatch.setattr(utils_mod.urllib.request, "urlopen", fake_urlopen)
+    out = utils_mod.fetch_html("https://x/", retries=5, backoff=0)
+    assert "ok" in out
+    assert calls["n"] == 3
+    _ = io  # silence "imported but unused" if it ever leaks
+
+
+# ---- Phase 5: new adapter dispatch ---------------------------------------
+
+def test_royalroad_adapter_matches_url():
+    from novel_dl.adapters.royalroad import RoyalRoadAdapter
+
+    assert RoyalRoadAdapter.matches(
+        "https://www.royalroad.com/fiction/12345/some-slug"
+    )
+    assert RoyalRoadAdapter.matches(
+        "https://royalroad.com/fiction/1/x"
+    )
+    assert not RoyalRoadAdapter.matches("https://other.com/")
+
+
+def test_scribblehub_adapter_matches_url():
+    from novel_dl.adapters.scribblehub import ScribbleHubAdapter
+
+    assert ScribbleHubAdapter.matches(
+        "https://www.scribblehub.com/series/9999/some-series/"
+    )
+    assert not ScribbleHubAdapter.matches("https://royalroad.com/")
+
+
+def test_registry_dispatches_to_new_adapters():
+    from novel_dl.adapters.royalroad import RoyalRoadAdapter
+    from novel_dl.adapters.scribblehub import ScribbleHubAdapter
+    from novel_dl.registry import get_adapter
+
+    rr = get_adapter("https://www.royalroad.com/fiction/1/x")
+    sh = get_adapter("https://www.scribblehub.com/series/2/y/")
+    assert isinstance(rr, RoyalRoadAdapter)
+    assert isinstance(sh, ScribbleHubAdapter)
+
+
+def test_royalroad_fetch_book_parses_chapter_list(monkeypatch):
+    """Regex over canned HTML. Tests our parser, not RR's actual site."""
+    from novel_dl.adapters import royalroad
+    from novel_dl.adapters.royalroad import RoyalRoadAdapter
+
+    fake_html = """
+    <html><head>
+      <meta property="og:title" content="My Story | Royal Road"/>
+      <meta property="og:description" content="A tale."/>
+      <meta property="og:image" content="https://x/cover.jpg"/>
+    </head><body>
+      <h1 class="font-white">My Story</h1>
+      <a href="/profile/77">Author Name</a>
+      <a href="/fiction/123/my-story/chapter/4001/prologue">Prologue</a>
+      <a href="/fiction/123/my-story/chapter/4002/ch-1">Ch 1</a>
+      <a href="/fiction/123/my-story/chapter/4003/ch-2">Ch 2</a>
+    </body></html>
+    """
+
+    monkeypatch.setattr(
+        royalroad, "fetch_html",
+        lambda url, headers=None: fake_html,
+    )
+
+    adapter = RoyalRoadAdapter()
+    book = adapter.fetch_book("https://www.royalroad.com/fiction/123/my-story")
+    assert book.title == "My Story"
+    assert book.author == "Author Name"
+    assert len(book.chapters) == 3
+    assert book.chapters[0].url.endswith("/chapter/4001/prologue")
+
+
+def test_royalroad_fetch_chapter_extracts_body(monkeypatch):
+    from novel_dl.adapters import royalroad
+    from novel_dl.adapters.royalroad import RoyalRoadAdapter
+    from novel_dl.core import Chapter
+
+    fake_html = """
+    <html><body>
+      <h1>Chapter 1: The Beginning</h1>
+      <div class="chapter-content user-defined">
+        <p>It was a dark and stormy night.</p>
+        <p>The wind howled.</p>
+      </div>
+      <div class="comments"></div>
+    </body></html>
+    """
+    monkeypatch.setattr(
+        royalroad, "fetch_html",
+        lambda url, headers=None: fake_html,
+    )
+    adapter = RoyalRoadAdapter()
+    ch = Chapter(num=1, title="x", url="https://x/chapter/1/y")
+    out = adapter.fetch_chapter(ch)
+    assert out.title.startswith("Chapter 1")
+    assert "dark and stormy" in (out.text or "")
+
+
+def test_scribblehub_fetch_chapter_extracts_chp_raw(monkeypatch):
+    from novel_dl.adapters import scribblehub
+    from novel_dl.adapters.scribblehub import ScribbleHubAdapter
+    from novel_dl.core import Chapter
+
+    fake_html = """
+    <html><body>
+      <div class="chapter-title">Ch 1 — Hello</div>
+      <div id="chp_raw">
+        <p>Para one.</p>
+        <p>Para two.</p>
+      </div>
+      <div class="footer"></div>
+    </body></html>
+    """
+    monkeypatch.setattr(
+        scribblehub, "fetch_html",
+        lambda url, headers=None: fake_html,
+    )
+    adapter = ScribbleHubAdapter()
+    ch = Chapter(num=1, title="x", url="https://www.scribblehub.com/read/1-x/chapter/1/")
+    out = adapter.fetch_chapter(ch)
+    assert "Hello" in out.title
+    assert "Para one" in (out.text or "")
