@@ -90,6 +90,22 @@ python3 execution/ranobe_pipeline.py \
 | freewebnovel.com | `https://freewebnovel.com/SLUG.html` | Работает |
 | ranobes.com | `https://ranobes.com/ranobe/SLUG.html` | Есть скрипт (ranobes_dl.py) |
 | ranobes.net | `https://ranobes.net/novels/<id>-<slug>.html` | Работает (`download_novel.py` + `ranobes_tool.py`) |
+| royalroad.com | `https://www.royalroad.com/fiction/<id>/<slug>` | Работает |
+| scribblehub.com | `https://www.scribblehub.com/series/<id>/<slug>/` | Работает |
+
+## Импорт локальных файлов
+Кнопка «Импорт файла…» в GUI принимает `.txt`, `.epub`, `.fb2` и режет
+файл на главы — дальше работают «Перевести скачанные» и «Собрать EPUB»
+как для скачанной книги. Режим «двуязычный EPUB» тоже работает.
+
+## Telegram-бот
+Запусти `execution/launchers/novel_dl_bot.bat` (или `python -m novel_dl.bot`),
+заранее задав переменные окружения:
+- `TG_BOT_TOKEN` — токен от @BotFather
+- `COHERE_API_KEY` — ключ Cohere
+
+Бот принимает ссылку на книгу в чате и отправляет EPUB обратно.
+Команды: `/help`, `/chapters 1-20`, `/lang en|ru`.
 
 ## Конкретная задача
 **Книга:** Horror Game Developer (My Games Aren't That Scary)

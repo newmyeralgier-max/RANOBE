@@ -1522,3 +1522,36 @@ def test_scribblehub_fetch_chapter_extracts_chp_raw(monkeypatch):
     out = adapter.fetch_chapter(ch)
     assert "Hello" in out.title
     assert "Para one" in (out.text or "")
+
+
+# ---- Phase 6: Telegram bot helpers ---------------------------------------
+
+def test_bot_parse_message_classifies_inputs():
+    from novel_dl.bot import _parse_message
+
+    assert _parse_message("/start")[0] == "command"
+    assert _parse_message("/help")[0] == "command"
+    assert _parse_message("/chapters 1-20") == ("range", "1-20")
+    assert _parse_message("/chapters") == ("range", "all")
+    assert _parse_message("/lang en") == ("lang", "en")
+    assert _parse_message("/lang RU") == ("lang", "ru")
+    # Bad lang falls back to ru.
+    assert _parse_message("/lang fr") == ("lang", "ru")
+    kind, payload = _parse_message(
+        "https://www.scribblehub.com/series/9999/x/"
+    )
+    assert kind == "url"
+    assert payload.startswith("https://")
+    assert _parse_message("hello")[0] == "other"
+    assert _parse_message("")[0] == "other"
+
+
+def test_bot_main_errors_without_token(monkeypatch, capsys):
+    """The CLI should exit nonzero with a friendly message when token missing."""
+    from novel_dl import bot
+
+    monkeypatch.delenv("TG_BOT_TOKEN", raising=False)
+    rc = bot.main(["--token", ""])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "TG_BOT_TOKEN" in captured.out
