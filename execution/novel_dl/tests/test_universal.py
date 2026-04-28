@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve()
@@ -1017,3 +1018,214 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ---- Phase 4: parallel download / translate ------------------------------
+
+class _SlowStubAdapter(SiteAdapter):
+    """Adapter whose fetch_chapter sleeps so we can detect overlap.
+
+    Tracks concurrency by incrementing/decrementing a counter under a lock
+    around the simulated network call; the test then checks that the
+    observed peak >1 when max_workers >1.
+    """
+
+    site_id = "slow-stub"
+
+    def __init__(self, bodies: dict[str, str], delay: float = 0.05) -> None:
+        self._bodies = bodies
+        self._delay = delay
+        self._lock = threading.Lock()
+        self.in_flight = 0
+        self.peak = 0
+        self.fetched: list[str] = []
+
+    @classmethod
+    def matches(cls, url: str) -> bool:  # pragma: no cover
+        return False
+
+    def fetch_book(self, url: str) -> Book:  # pragma: no cover
+        raise NotImplementedError
+
+    def fetch_chapter(self, chapter: Chapter) -> Chapter:
+        with self._lock:
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+            self.fetched.append(chapter.url)
+        try:
+            time.sleep(self._delay)
+            chapter.text = self._bodies.get(chapter.url, "body")
+            return chapter
+        finally:
+            with self._lock:
+                self.in_flight -= 1
+
+
+def test_download_parallel_runs_concurrent_workers(tmp_path):
+    """max_workers=3 must let at least 2 fetches overlap in time."""
+    import time as _t  # local alias to avoid clashing with module import below
+    _ = _t
+    book = _stub_book()
+    adapter = _SlowStubAdapter(
+        {f"https://x/{i}": f"body {i}" for i in range(1, 6)},
+        delay=0.08,
+    )
+    out_dir = tmp_path / "out"
+    download_chapters(
+        adapter, book, [1, 2, 3, 4, 5], out_dir,
+        delay=0, max_workers=3,
+    )
+    assert adapter.peak >= 2, (
+        f"expected concurrent fetches with max_workers=3, peak was {adapter.peak}"
+    )
+    # All chapters landed on disk in correct order.
+    files = sorted(out_dir.glob("chapter_*.txt"))
+    assert len(files) == 5
+
+
+def test_download_parallel_serial_order_preserved(tmp_path):
+    """combined.txt must follow source order even when completion is shuffled."""
+    book = _stub_book()
+    # Reverse delays so high-numbered chapters return first.
+    delays = {f"https://x/{i}": 0.02 * (6 - i) for i in range(1, 6)}
+
+    class _ShuffleAdapter(_SlowStubAdapter):
+        def fetch_chapter(self, chapter):
+            self._delay = delays[chapter.url]
+            return super().fetch_chapter(chapter)
+
+    adapter = _ShuffleAdapter(
+        {f"https://x/{i}": f"body-{i}" for i in range(1, 6)},
+    )
+    out_dir = tmp_path / "out"
+    combined = tmp_path / "combined.txt"
+    download_chapters(
+        adapter, book, [1, 2, 3, 4, 5], out_dir,
+        delay=0, max_workers=3, combined_path=combined,
+    )
+    text = combined.read_text(encoding="utf-8")
+    # Bodies must appear in order body-1 < body-2 < body-3 ... in the file.
+    positions = [text.index(f"body-{i}") for i in range(1, 6)]
+    assert positions == sorted(positions), (
+        f"combined.txt out of order: {positions}"
+    )
+
+
+def test_download_parallel_respects_cancel(tmp_path):
+    """A cancel mid-batch stops accepting new work and reports stats."""
+    book = _stub_book()
+    cancel = threading.Event()
+
+    class _CancellingAdapter(_SlowStubAdapter):
+        def fetch_chapter(self, chapter):
+            ch = super().fetch_chapter(chapter)
+            # Trigger cancel after the very first chapter completes.
+            cancel.set()
+            return ch
+
+    adapter = _CancellingAdapter(
+        {f"https://x/{i}": f"body {i}" for i in range(1, 6)},
+        delay=0.02,
+    )
+    out_dir = tmp_path / "out"
+    try:
+        download_chapters(
+            adapter, book, [1, 2, 3, 4, 5], out_dir,
+            delay=0, max_workers=2, cancel_event=cancel,
+        )
+    except DownloadCancelled as exc:
+        # We saved at least 1 chapter; we may have saved up to ~2 since
+        # one was already in flight when cancel fired.
+        assert 1 <= exc.downloaded <= 4
+        assert len(adapter.fetched) <= 5
+        return
+    raise AssertionError("expected DownloadCancelled when cancel was set")
+
+
+def test_translate_folder_parallel_runs_concurrent(tmp_path, monkeypatch):
+    """When use_prior_context is False and max_workers=2, two chapters can run at once."""
+    from novel_dl import translator as tr
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    for i in range(1, 5):
+        (src / f"chapter_{i:04d}.txt").write_text(
+            f"# Chapter {i}\n\nbody {i}\n", encoding="utf-8"
+        )
+
+    in_flight = {"n": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def fake_translate_chapter_file(
+        src_path, dst_path, cfg,
+        *, progress=None, cancel_event=None, pause_event=None,
+        chunk_done=None, prior_context="",
+    ):
+        with lock:
+            in_flight["n"] += 1
+            in_flight["peak"] = max(in_flight["peak"], in_flight["n"])
+        try:
+            time.sleep(0.05)
+            raw = src_path.read_text(encoding="utf-8")
+            dst_path.write_text("[ru] " + raw, encoding="utf-8")
+            return "translated"
+        finally:
+            with lock:
+                in_flight["n"] -= 1
+
+    monkeypatch.setattr(tr, "translate_chapter_file", fake_translate_chapter_file)
+
+    cfg = tr.TranslatorConfig(
+        api_key="x", model="m", system_prompt="p", use_prior_context=False,
+    )
+    out = tr.translate_folder(src, dst, cfg, max_workers=2)
+    assert len(out) == 4
+    assert in_flight["peak"] >= 2, (
+        f"expected parallel translate, observed peak {in_flight['peak']}"
+    )
+
+
+def test_translate_folder_parallel_falls_back_to_serial_when_context_on(
+    tmp_path, monkeypatch,
+):
+    """use_prior_context=True must force serial regardless of max_workers."""
+    from novel_dl import translator as tr
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    for i in range(1, 4):
+        (src / f"chapter_{i:04d}.txt").write_text(
+            f"# Chapter {i}\n\nbody {i}\n", encoding="utf-8"
+        )
+
+    in_flight = {"n": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def fake_translate_chapter_file(
+        src_path, dst_path, cfg,
+        *, progress=None, cancel_event=None, pause_event=None,
+        chunk_done=None, prior_context="",
+    ):
+        with lock:
+            in_flight["n"] += 1
+            in_flight["peak"] = max(in_flight["peak"], in_flight["n"])
+        try:
+            time.sleep(0.03)
+            dst_path.write_text(f"# t{src_path.name}\n\nx\n", encoding="utf-8")
+            return "x"
+        finally:
+            with lock:
+                in_flight["n"] -= 1
+
+    monkeypatch.setattr(tr, "translate_chapter_file", fake_translate_chapter_file)
+
+    cfg = tr.TranslatorConfig(
+        api_key="x", model="m", system_prompt="p", use_prior_context=True,
+    )
+    tr.translate_folder(src, dst, cfg, max_workers=3)
+    # With context on, parallelism is forced down to 1.
+    assert in_flight["peak"] == 1, (
+        f"expected serial translate when context on, peak was {in_flight['peak']}"
+    )

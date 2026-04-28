@@ -321,6 +321,21 @@ class NovelDownloaderApp:
         self.force_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(opts, text="Перезагружать уже скачанные",
                         variable=self.force_var).pack(side="left", padx=(16, 0))
+        # Phase 4: parallel downloads. Capped at 5 because most novel
+        # sites quickly trip Cloudflare past that, and the per-worker
+        # jittered delay still applies. 1 = strictly sequential (the
+        # safest default; we kept it as default not to surprise users
+        # who never asked for parallelism).
+        ttk.Label(opts, text="Параллельно:").pack(side="left", padx=(20, 4))
+        self.parallel_dl_var = tk.IntVar(value=1)
+        ttk.Spinbox(
+            opts, from_=1, to=5, width=3,
+            textvariable=self.parallel_dl_var,
+        ).pack(side="left")
+        ttk.Label(
+            opts, foreground="#555",
+            text="(1 — по одной; 3 — быстрее, но рискуешь Cloudflare)",
+        ).pack(side="left", padx=(4, 0))
 
         action = ttk.Frame(self.root)
         action.pack(fill="x", **pad)
@@ -511,6 +526,31 @@ class NovelDownloaderApp:
             text="Память контекста (последние абзацы прошлой главы)",
             variable=self.use_context_var,
         ).pack(side="left", padx=(12, 0))
+
+        # Phase 4: parallel translation across chapters. Cohere's per-key
+        # rate limit is the real ceiling here; on the trial tier 2 is the
+        # comfortable maximum, on paid tiers 3 is fine. NOTE: parallelism
+        # silently downgrades to 1 when "Память контекста" is on, because
+        # the chain N→N+1 is fundamentally sequential. We surface that in
+        # the hint label so it isn't a mystery.
+        par_tr_row = ttk.Frame(tr)
+        par_tr_row.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Label(par_tr_row, text="Параллельно:").pack(side="left")
+        self.parallel_tr_var = tk.IntVar(value=1)
+        ttk.Spinbox(
+            par_tr_row, from_=1, to=3, width=3,
+            textvariable=self.parallel_tr_var,
+        ).pack(side="left", padx=(4, 8))
+        ttk.Label(
+            par_tr_row, foreground="#555",
+            text=(
+                "(1 — последовательно. 2-3 ускоряют перевод, но "
+                "несовместимы с «Память контекста» — она требует строгой "
+                "очерёдности глав, поэтому при включённой памяти "
+                "параллельность сама вернётся к 1.)"
+            ),
+            wraplength=560, justify="left",
+        ).pack(side="left")
 
         epub_row = ttk.Frame(tr)
         epub_row.pack(fill="x", padx=8, pady=(2, 8))
@@ -790,6 +830,9 @@ class NovelDownloaderApp:
             "dark_mode": bool(self.dark_mode_var.get()),
             "use_prior_context": bool(self.use_context_var.get()),
             "bilingual_epub": bool(self.bilingual_var.get()),
+            # Phase 4: parallelism settings.
+            "parallel_downloads": int(self.parallel_dl_var.get() or 1),
+            "parallel_translates": int(self.parallel_tr_var.get() or 1),
         }
 
     def _apply_settings(self, s: dict[str, object]) -> None:
@@ -855,6 +898,15 @@ class NovelDownloaderApp:
         self.use_context_var.set(_b("use_prior_context", True))
         self.bilingual_var.set(_b("bilingual_epub", False))
 
+        def _i(key: str, default: int, lo: int, hi: int) -> int:
+            try:
+                return max(lo, min(hi, int(s.get(key, default))))
+            except (TypeError, ValueError):
+                return default
+
+        self.parallel_dl_var.set(_i("parallel_downloads", 1, 1, 5))
+        self.parallel_tr_var.set(_i("parallel_translates", 1, 1, 3))
+
     def _save_current_settings(self) -> None:
         try:
             save_settings(self._current_settings())
@@ -881,6 +933,8 @@ class NovelDownloaderApp:
             # Phase 3.2 / 3.4: persist the toggles so users don't have
             # to re-tick them on every launch.
             self.use_context_var, self.bilingual_var,
+            # Phase 4: parallelism spinboxes.
+            self.parallel_dl_var, self.parallel_tr_var,
         )
         for var in traced_vars:
             try:
@@ -1182,6 +1236,7 @@ class NovelDownloaderApp:
                 combined_path=combined,
                 cancel_event=cancel_event,
                 pause_event=self._pause_event,
+                max_workers=max(1, int(self.parallel_dl_var.get() or 1)),
             )
         except DownloadCancelled as exc:
             self._messages.put(_Error(
@@ -1293,6 +1348,7 @@ class NovelDownloaderApp:
                 pause_event=self._pause_event,
                 wanted_numbers=wanted,
                 chunk_done=chunk_done,
+                max_workers=max(1, int(self.parallel_tr_var.get() or 1)),
             )
         except TranslationCancelled as exc:
             self._messages.put(_Error(

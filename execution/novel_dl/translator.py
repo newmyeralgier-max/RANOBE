@@ -18,6 +18,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -553,11 +554,20 @@ def translate_folder(
     pause_event: "threading.Event | None" = None,
     wanted_numbers: "set[int] | None" = None,
     chunk_done: Callable[[int], None] | None = None,
+    max_workers: int = 1,
 ) -> list[Path]:
     """Translate every ``chapter_*.txt`` in ``src_dir`` into ``dst_dir``.
 
     If ``wanted_numbers`` is given, only files whose leading 4-digit
     chapter number is in the set are translated.
+
+    ``max_workers`` (default 1 = strictly sequential) caps how many chapter
+    translations can be in flight at once. >1 dispatches to a parallel
+    path that runs whole chapters concurrently. The cross-chapter context
+    feature is fundamentally sequential (each chapter's translation needs
+    the *previous* chapter's tail), so when ``cfg.use_prior_context`` is
+    true we transparently fall back to serial regardless of
+    ``max_workers`` — the consistency win is worth more than the speed.
     """
     all_files = sorted(src_dir.glob("chapter_*.txt"))
     if not all_files:
@@ -576,6 +586,22 @@ def translate_folder(
         files = all_files
 
     dst_dir.mkdir(parents=True, exist_ok=True)
+    # Parallel path: only safe to take when cross-chapter context is OFF,
+    # since context inherently chains chapter N's translation onto N-1's
+    # output. With context ON we silently fall back to serial — the
+    # alternative is "fast but inconsistent character names", which
+    # defeats the whole point of the feature.
+    if max_workers > 1 and not cfg.use_prior_context:
+        return _translate_folder_parallel(
+            files, dst_dir, cfg,
+            force=force,
+            progress=progress,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            chunk_done=chunk_done,
+            max_workers=max_workers,
+        )
+
     done: list[Path] = []
     last_ok_idx: int | None = None
     # Cross-chapter context: tail of the previous chapter's translation,
@@ -632,6 +658,159 @@ def translate_folder(
         if cfg.use_prior_context and n_ctx > 0:
             prior_context = _tail_paragraphs(translated_body, n_ctx)
     return done
+
+
+def _translate_folder_parallel(
+    files: list[Path], dst_dir: Path, cfg: TranslatorConfig,
+    *, force: bool,
+    progress: Callable[[str], None] | None,
+    cancel_event: "threading.Event | None",
+    pause_event: "threading.Event | None",
+    chunk_done: Callable[[int], None] | None,
+    max_workers: int,
+) -> list[Path]:
+    """Parallel translation across chapters (no cross-chapter context).
+
+    Each chapter is still translated chunk-by-chunk on its own worker
+    thread, so intra-chapter continuity is preserved. Only the
+    *between-chapter* bottleneck goes away. Cached chapters (dst file
+    already exists) are skipped inline on the dispatcher thread.
+
+    On the first per-chapter failure we stop accepting new work and
+    drain the in-flight set, then re-raise — exactly like the serial
+    path so the GUI's existing error-handling stays intact.
+
+    Progress / chunk_done callbacks fire from worker threads, so the
+    caller has to be thread-safe (the GUI's queue-of-messages already
+    is — that's what we built it for).
+    """
+    log_lock = threading.Lock()
+
+    def safe_progress(msg: str) -> None:
+        if progress is None:
+            return
+        # Serialise prints so two concurrent chunks don't interleave their
+        # log lines into half-readable garbage.
+        with log_lock:
+            progress(msg)
+
+    safe_chunk_done: Callable[[int], None] | None = None
+    if chunk_done is not None:
+        chunk_lock = threading.Lock()
+
+        def _safe_chunk_done(n_chars: int) -> None:
+            # chunk_done in the GUI just enqueues a message — already
+            # thread-safe — but lock for paranoia in case a future caller
+            # mutates shared state directly.
+            with chunk_lock:
+                chunk_done(n_chars)
+
+        safe_chunk_done = _safe_chunk_done
+
+    done_set: dict[int, Path] = {}  # 1-based index -> dst path
+    last_ok_idx: int | None = None
+    failure: BaseException | None = None
+    cancelled = False
+
+    # Process cached chapters synchronously up front. They're free and
+    # there's no point queuing them.
+    pending: list[tuple[int, Path]] = []
+    for i, src in enumerate(files, start=1):
+        dst = dst_dir / src.name
+        if dst.exists() and not force:
+            done_set[i] = dst
+            last_ok_idx = i
+            safe_progress(f"[{i}/{len(files)}] skip (exists): {src.name}")
+        else:
+            pending.append((i, src))
+
+    def translate_one(i: int, src: Path) -> tuple[int, Path]:
+        if cancel_event is not None and cancel_event.is_set():
+            raise TranslationCancelled("cancel before translate")
+        wait_if_paused(pause_event, cancel_event)
+        dst = dst_dir / src.name
+        safe_progress(f"[{i}/{len(files)}] translating: {src.name}")
+        translate_chapter_file(
+            src, dst, cfg,
+            progress=safe_progress,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            chunk_done=safe_chunk_done,
+            # Parallel path is only entered when use_prior_context is
+            # False, so prior_context stays empty. Passing it explicitly
+            # keeps behaviour symmetric with the serial path.
+            prior_context="",
+        )
+        return i, dst
+
+    pending_iter = iter(pending)
+    in_flight: dict = {}  # future -> i
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for _ in range(min(max_workers, len(pending))):
+            try:
+                i, src = next(pending_iter)
+            except StopIteration:
+                break
+            in_flight[pool.submit(translate_one, i, src)] = i
+
+        while in_flight and failure is None and not cancelled:
+            ready, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for fut in ready:
+                i = in_flight.pop(fut)
+                exc = fut.exception()
+                if isinstance(exc, TranslationCancelled):
+                    cancelled = True
+                    continue
+                if exc is not None:
+                    failure = exc
+                    continue
+                _, dst = fut.result()
+                done_set[i] = dst
+                if last_ok_idx is None or i > last_ok_idx:
+                    last_ok_idx = i
+                if failure is None and not cancelled and (
+                    cancel_event is None or not cancel_event.is_set()
+                ):
+                    try:
+                        ni, nsrc = next(pending_iter)
+                    except StopIteration:
+                        continue
+                    in_flight[pool.submit(translate_one, ni, nsrc)] = ni
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+
+        # Drain remainder so pool shutdown doesn't block on stuck workers.
+        if in_flight:
+            for fut in list(in_flight):
+                try:
+                    res = fut.result(timeout=60)
+                except Exception:
+                    continue
+                idx, dst = res
+                done_set.setdefault(idx, dst)
+
+    ordered = [done_set[i] for i in range(1, len(files) + 1) if i in done_set]
+
+    if cancelled or (cancel_event is not None and cancel_event.is_set()):
+        raise TranslationCancelled(
+            f"Остановлено пользователем. Готово {len(ordered)}/{len(files)}.",
+            translated=len(ordered),
+            last_ok=last_ok_idx,
+        )
+    if failure is not None:
+        if isinstance(failure, TranslationError):
+            raise TranslationError(
+                str(failure),
+                translated=len(ordered),
+                last_ok=last_ok_idx,
+            )
+        raise TranslationError(
+            f"Перевод упал: {failure!r}",
+            translated=len(ordered),
+            last_ok=last_ok_idx,
+        )
+    return ordered
 
 
 def _split_title(raw: str) -> tuple[str, str]:
