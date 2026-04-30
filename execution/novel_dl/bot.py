@@ -30,12 +30,15 @@ re-issued URL just rebuilds the EPUB without re-downloading.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import logging
 import mimetypes
 import os
 import re
 import secrets
+import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -52,6 +55,19 @@ from .translator import TranslationError, TranslatorConfig, translate_folder
 from .utils import safe_filename
 
 LOG = logging.getLogger("novel_dl.bot")
+
+# Errors that signal a transient network blip rather than a real Telegram
+# error. We retry these in long-poll instead of crashing the bot.
+_TRANSIENT_NET_ERRORS: tuple[type[BaseException], ...] = (
+    urllib.error.URLError,
+    http.client.RemoteDisconnected,
+    http.client.IncompleteRead,
+    http.client.BadStatusLine,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    TimeoutError,
+    socket.timeout,
+)
 
 _API_BASE = "https://api.telegram.org/bot{token}/{method}"
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
@@ -157,14 +173,26 @@ def _parse_message(text: str) -> tuple[str, str]:
     text = text.strip()
     if not text:
         return ("other", "")
-    if text.startswith("/start") or text.startswith("/help"):
+
+    # In groups, Telegram appends @botusername to commands ("/chapters@foo_bot
+    # 1-3"). Strip that suffix so the rest of the parser doesn't see it.
+    def _split_command(cmd: str) -> tuple[str, str] | None:
+        head, _, tail = text.partition(" ")
+        head_no_at = head.split("@", 1)[0]
+        if head_no_at == cmd:
+            return (head_no_at, tail.strip())
+        return None
+
+    if (parts := _split_command("/start")) is not None:
         return ("command", "/help")
-    if text.startswith("/chapters"):
-        rest = text[len("/chapters"):].strip()
-        return ("range", rest or "all")
-    if text.startswith("/lang"):
-        rest = text[len("/lang"):].strip().lower()
+    if (parts := _split_command("/help")) is not None:
+        return ("command", "/help")
+    if (parts := _split_command("/chapters")) is not None:
+        return ("range", parts[1] or "all")
+    if (parts := _split_command("/lang")) is not None:
+        rest = parts[1].lower()
         return ("lang", rest if rest in ("en", "ru") else "ru")
+
     m = _URL_RE.search(text)
     if m:
         return ("url", m.group(0))
@@ -348,16 +376,28 @@ def run_bot(
     offset = 0
 
     LOG.info("Bot started; long-polling Telegram…")
+    backoff = 5.0
     while True:
         try:
             data = _api_call(
                 token, "getUpdates",
                 offset=offset, timeout=30,
             )
-        except urllib.error.URLError as exc:
-            LOG.warning("getUpdates failed: %s — retrying in 5s", exc)
+        except _TRANSIENT_NET_ERRORS as exc:
+            wait = min(backoff, 60.0)
+            LOG.warning(
+                "getUpdates failed: %s (%s) — retrying in %.0fs",
+                type(exc).__name__, exc, wait,
+            )
+            time.sleep(wait)
+            backoff = min(backoff * 1.5, 60.0)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            # Don't let an unexpected exception kill the bot — log and retry.
+            LOG.exception("Unexpected error in poll loop: %s", exc)
             time.sleep(5)
             continue
+        backoff = 5.0
         if not data.get("ok"):
             LOG.warning("Telegram returned error: %s", data)
             time.sleep(5)
@@ -425,8 +465,23 @@ def run_bot(
                 )
 
 
+def _force_utf8_console() -> None:
+    """Force stdout/stderr to UTF-8 so Cyrillic logs render correctly.
+
+    Windows consoles default to CP866 / CP1251, which mangles UTF-8 text
+    (the dreaded ``╨С╨╛╤В…`` mojibake). ``reconfigure`` is available in
+    Python 3.7+ and silently no-ops if the stream doesn't support it.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point: read token + Cohere key from env or args, start polling."""
+    _force_utf8_console()
     parser = argparse.ArgumentParser(description="Telegram bot для novel_dl")
     parser.add_argument(
         "--token", default=os.environ.get("TG_BOT_TOKEN", ""),
