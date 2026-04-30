@@ -20,12 +20,13 @@ def _xml_escape(text: str) -> str:
     return html.escape(text, quote=True)
 
 
+def _paragraph_html(p: str) -> str:
+    return f"<p>{_xml_escape(p).replace(chr(10), '<br/>')}</p>"
+
+
 def _xhtml_from_chapter(title: str, body: str) -> str:
     paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
-    paras = "\n".join(
-        f"<p>{_xml_escape(p).replace(chr(10), '<br/>')}</p>"
-        for p in paragraphs
-    )
+    paras = "\n".join(_paragraph_html(p) for p in paragraphs)
     return (
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<!DOCTYPE html>\n'
@@ -39,6 +40,68 @@ def _xhtml_from_chapter(title: str, body: str) -> str:
         '</head>\n'
         '<body>\n'
         f'  <h1>{_xml_escape(title)}</h1>\n'
+        f'{paras}\n'
+        '</body>\n</html>\n'
+    )
+
+
+def _xhtml_from_bilingual_chapter(
+    title_en: str, body_en: str,
+    title_ru: str, body_ru: str,
+) -> str:
+    """Render a bilingual chapter: en paragraph then ru paragraph, repeating.
+
+    For language learning the side-by-side pattern that's actually
+    helpful is the same paragraph in both languages, top-to-bottom —
+    not separate columns, since e-readers reflow text and most kill
+    real columns. We mark each paragraph with a CSS class so a
+    motivated user can hide one language with their reader's stylesheet
+    if they want a single-language reading pass. When the two bodies
+    have a different number of paragraphs (translator merged or split
+    something) we still render both — extra paragraphs from the longer
+    side land at the end labelled with their language.
+    """
+    paras_en = [p.strip() for p in body_en.split("\n\n") if p.strip()]
+    paras_ru = [p.strip() for p in body_ru.split("\n\n") if p.strip()]
+    rows: list[str] = []
+    n = max(len(paras_en), len(paras_ru))
+    for i in range(n):
+        if i < len(paras_en):
+            rows.append(
+                f'<p class="bi-en" lang="en" xml:lang="en">'
+                f'{_xml_escape(paras_en[i]).replace(chr(10), "<br/>")}</p>'
+            )
+        if i < len(paras_ru):
+            rows.append(
+                f'<p class="bi-ru" lang="ru" xml:lang="ru">'
+                f'{_xml_escape(paras_ru[i]).replace(chr(10), "<br/>")}</p>'
+            )
+    paras = "\n".join(rows)
+    title_block = (
+        f'<h1 lang="ru" xml:lang="ru">{_xml_escape(title_ru or title_en)}</h1>\n'
+        f'<h2 class="bi-en" lang="en" xml:lang="en" '
+        f'style="font-weight:normal;font-size:1.0em;color:#666;'
+        f'margin-top:-0.4em;">{_xml_escape(title_en)}</h2>'
+    ) if title_en and title_en != title_ru else (
+        f'<h1>{_xml_escape(title_ru or title_en)}</h1>'
+    )
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<!DOCTYPE html>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml" '
+        'xmlns:epub="http://www.idpf.org/2007/ops" lang="ru" xml:lang="ru">\n'
+        '<head>\n'
+        f'  <title>{_xml_escape(title_ru or title_en)}</title>\n'
+        '  <meta charset="utf-8"/>\n'
+        '  <style>body{font-family:serif;line-height:1.55;margin:1.2em}'
+        'h1{font-size:1.3em}'
+        'p{margin:0 0 0.6em 0;text-indent:1.2em}'
+        'p.bi-en{color:#444;font-style:italic}'
+        'p.bi-ru{color:#000}'
+        '</style>\n'
+        '</head>\n'
+        '<body>\n'
+        f'  {title_block}\n'
         f'{paras}\n'
         '</body>\n</html>\n'
     )
@@ -191,6 +254,85 @@ def build_epub_from_folder(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(out_path, "w") as zf:
         # mimetype MUST be the first entry and stored uncompressed.
+        zf.writestr(
+            zipfile.ZipInfo("mimetype"),
+            "application/epub+zip",
+            compress_type=zipfile.ZIP_STORED,
+        )
+        zf.writestr("META-INF/container.xml", _CONTAINER_XML,
+                    compress_type=zipfile.ZIP_DEFLATED)
+        zf.writestr("OEBPS/content.opf", content_opf,
+                    compress_type=zipfile.ZIP_DEFLATED)
+        zf.writestr("OEBPS/nav.xhtml", nav_xhtml,
+                    compress_type=zipfile.ZIP_DEFLATED)
+        for href, _title, xhtml in chapters:
+            zf.writestr(f"OEBPS/{href}", xhtml,
+                        compress_type=zipfile.ZIP_DEFLATED)
+    return out_path
+
+
+def build_bilingual_epub_from_folders(
+    en_dir: Path, ru_dir: Path, out_path: Path, *,
+    book_title: str,
+    author: str = "",
+    wanted_numbers: set[int] | None = None,
+) -> Path:
+    """Bilingual EPUB: English paragraph followed by Russian paragraph.
+
+    Pairs ``en_dir/chapter_NNNN_*.txt`` with ``ru_dir/chapter_NNNN_*.txt``
+    by chapter number. Chapters that are missing one side are skipped
+    with a clear error rather than rendered half-blank — the user
+    almost certainly forgot to translate that chapter and we don't want
+    a misleading bilingual book.
+    """
+    en_files = {
+        int(_CHAPTER_FILE_RE.match(p.name).group(1)): p
+        for p in en_dir.glob("chapter_*.txt")
+        if _CHAPTER_FILE_RE.match(p.name)
+    }
+    ru_files = {
+        int(_CHAPTER_FILE_RE.match(p.name).group(1)): p
+        for p in ru_dir.glob("chapter_*.txt")
+        if _CHAPTER_FILE_RE.match(p.name)
+    }
+    if not en_files:
+        raise RuntimeError(
+            f"В папке {en_dir} нет английских chapter_*.txt — "
+            "нечего собирать в двуязычный EPUB."
+        )
+    if not ru_files:
+        raise RuntimeError(
+            f"В папке {ru_dir} нет русских chapter_*.txt — "
+            "сначала переведи главы."
+        )
+
+    common_nums = sorted(set(en_files) & set(ru_files))
+    if wanted_numbers is not None:
+        common_nums = [n for n in common_nums if n in wanted_numbers]
+    if not common_nums:
+        raise RuntimeError(
+            "Нет глав, у которых есть и английская, и русская версия. "
+            "Переведи главы целиком и попробуй снова."
+        )
+
+    chapters: list[tuple[str, str, str]] = []
+    for idx, num in enumerate(common_nums, start=1):
+        title_en, body_en = _read_chapter_file(en_files[num])
+        title_ru, body_ru = _read_chapter_file(ru_files[num])
+        href = f"ch{idx:04d}.xhtml"
+        chapters.append((
+            href,
+            title_ru or title_en,
+            _xhtml_from_bilingual_chapter(title_en, body_en, title_ru, body_ru),
+        ))
+
+    book_id = str(uuid.uuid4())
+    toc_entries = [(href, title) for (href, title, _) in chapters]
+    content_opf = _content_opf(book_title, author, book_id, toc_entries)
+    nav_xhtml = _nav_xhtml(toc_entries)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(out_path, "w") as zf:
         zf.writestr(
             zipfile.ZipInfo("mimetype"),
             "application/epub+zip",

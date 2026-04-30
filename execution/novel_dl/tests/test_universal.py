@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve()
@@ -410,7 +411,8 @@ def test_translator_refuses_to_write_empty_translation(tmp_path, monkeypatch):
 
     # Stub out the network. Title translates, body translates to "" (silent
     # refusal) — this is the scenario we need to catch.
-    def fake_translate(text, cfg, *, progress=None):
+    def fake_translate(text, cfg, *, progress=None, pause_event=None,
+                       cancel_event=None, prior_context=""):
         return "Заголовок" if text.strip() == "Title" else ""
 
     monkeypatch.setattr(mod, "translate_text", fake_translate)
@@ -589,7 +591,7 @@ def test_translator_range_filter(tmp_path, monkeypatch):
     dst = tmp_path / "ru"
     monkeypatch.setattr(
         mod, "translate_text",
-        lambda text, cfg, *, progress=None: f"<<{text[:10]}>>",
+        lambda text, cfg, *, progress=None, pause_event=None, cancel_event=None, prior_context="": f"<<{text[:10]}>>",
     )
     cfg = mod.TranslatorConfig(api_key="x", model="m", system_prompt="p")
     got = mod.translate_folder(src, dst, cfg, wanted_numbers={2})
@@ -1016,3 +1018,540 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ---- Phase 4: parallel download / translate ------------------------------
+
+class _SlowStubAdapter(SiteAdapter):
+    """Adapter whose fetch_chapter sleeps so we can detect overlap.
+
+    Tracks concurrency by incrementing/decrementing a counter under a lock
+    around the simulated network call; the test then checks that the
+    observed peak >1 when max_workers >1.
+    """
+
+    site_id = "slow-stub"
+
+    def __init__(self, bodies: dict[str, str], delay: float = 0.05) -> None:
+        self._bodies = bodies
+        self._delay = delay
+        self._lock = threading.Lock()
+        self.in_flight = 0
+        self.peak = 0
+        self.fetched: list[str] = []
+
+    @classmethod
+    def matches(cls, url: str) -> bool:  # pragma: no cover
+        return False
+
+    def fetch_book(self, url: str) -> Book:  # pragma: no cover
+        raise NotImplementedError
+
+    def fetch_chapter(self, chapter: Chapter) -> Chapter:
+        with self._lock:
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+            self.fetched.append(chapter.url)
+        try:
+            time.sleep(self._delay)
+            chapter.text = self._bodies.get(chapter.url, "body")
+            return chapter
+        finally:
+            with self._lock:
+                self.in_flight -= 1
+
+
+def test_download_parallel_runs_concurrent_workers(tmp_path):
+    """max_workers=3 must let at least 2 fetches overlap in time."""
+    import time as _t  # local alias to avoid clashing with module import below
+    _ = _t
+    book = _stub_book()
+    adapter = _SlowStubAdapter(
+        {f"https://x/{i}": f"body {i}" for i in range(1, 6)},
+        delay=0.08,
+    )
+    out_dir = tmp_path / "out"
+    download_chapters(
+        adapter, book, [1, 2, 3, 4, 5], out_dir,
+        delay=0, max_workers=3,
+    )
+    assert adapter.peak >= 2, (
+        f"expected concurrent fetches with max_workers=3, peak was {adapter.peak}"
+    )
+    # All chapters landed on disk in correct order.
+    files = sorted(out_dir.glob("chapter_*.txt"))
+    assert len(files) == 5
+
+
+def test_download_parallel_serial_order_preserved(tmp_path):
+    """combined.txt must follow source order even when completion is shuffled."""
+    book = _stub_book()
+    # Reverse delays so high-numbered chapters return first.
+    delays = {f"https://x/{i}": 0.02 * (6 - i) for i in range(1, 6)}
+
+    class _ShuffleAdapter(_SlowStubAdapter):
+        def fetch_chapter(self, chapter):
+            self._delay = delays[chapter.url]
+            return super().fetch_chapter(chapter)
+
+    adapter = _ShuffleAdapter(
+        {f"https://x/{i}": f"body-{i}" for i in range(1, 6)},
+    )
+    out_dir = tmp_path / "out"
+    combined = tmp_path / "combined.txt"
+    download_chapters(
+        adapter, book, [1, 2, 3, 4, 5], out_dir,
+        delay=0, max_workers=3, combined_path=combined,
+    )
+    text = combined.read_text(encoding="utf-8")
+    # Bodies must appear in order body-1 < body-2 < body-3 ... in the file.
+    positions = [text.index(f"body-{i}") for i in range(1, 6)]
+    assert positions == sorted(positions), (
+        f"combined.txt out of order: {positions}"
+    )
+
+
+def test_download_parallel_respects_cancel(tmp_path):
+    """A cancel mid-batch stops accepting new work and reports stats."""
+    book = _stub_book()
+    cancel = threading.Event()
+
+    class _CancellingAdapter(_SlowStubAdapter):
+        def fetch_chapter(self, chapter):
+            ch = super().fetch_chapter(chapter)
+            # Trigger cancel after the very first chapter completes.
+            cancel.set()
+            return ch
+
+    adapter = _CancellingAdapter(
+        {f"https://x/{i}": f"body {i}" for i in range(1, 6)},
+        delay=0.02,
+    )
+    out_dir = tmp_path / "out"
+    try:
+        download_chapters(
+            adapter, book, [1, 2, 3, 4, 5], out_dir,
+            delay=0, max_workers=2, cancel_event=cancel,
+        )
+    except DownloadCancelled as exc:
+        # We saved at least 1 chapter; we may have saved up to ~2 since
+        # one was already in flight when cancel fired.
+        assert 1 <= exc.downloaded <= 4
+        assert len(adapter.fetched) <= 5
+        return
+    raise AssertionError("expected DownloadCancelled when cancel was set")
+
+
+def test_translate_folder_parallel_runs_concurrent(tmp_path, monkeypatch):
+    """When use_prior_context is False and max_workers=2, two chapters can run at once."""
+    from novel_dl import translator as tr
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    for i in range(1, 5):
+        (src / f"chapter_{i:04d}.txt").write_text(
+            f"# Chapter {i}\n\nbody {i}\n", encoding="utf-8"
+        )
+
+    in_flight = {"n": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def fake_translate_chapter_file(
+        src_path, dst_path, cfg,
+        *, progress=None, cancel_event=None, pause_event=None,
+        chunk_done=None, prior_context="",
+    ):
+        with lock:
+            in_flight["n"] += 1
+            in_flight["peak"] = max(in_flight["peak"], in_flight["n"])
+        try:
+            time.sleep(0.05)
+            raw = src_path.read_text(encoding="utf-8")
+            dst_path.write_text("[ru] " + raw, encoding="utf-8")
+            return "translated"
+        finally:
+            with lock:
+                in_flight["n"] -= 1
+
+    monkeypatch.setattr(tr, "translate_chapter_file", fake_translate_chapter_file)
+
+    cfg = tr.TranslatorConfig(
+        api_key="x", model="m", system_prompt="p", use_prior_context=False,
+    )
+    out = tr.translate_folder(src, dst, cfg, max_workers=2)
+    assert len(out) == 4
+    assert in_flight["peak"] >= 2, (
+        f"expected parallel translate, observed peak {in_flight['peak']}"
+    )
+
+
+def test_translate_folder_parallel_falls_back_to_serial_when_context_on(
+    tmp_path, monkeypatch,
+):
+    """use_prior_context=True must force serial regardless of max_workers."""
+    from novel_dl import translator as tr
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    for i in range(1, 4):
+        (src / f"chapter_{i:04d}.txt").write_text(
+            f"# Chapter {i}\n\nbody {i}\n", encoding="utf-8"
+        )
+
+    in_flight = {"n": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def fake_translate_chapter_file(
+        src_path, dst_path, cfg,
+        *, progress=None, cancel_event=None, pause_event=None,
+        chunk_done=None, prior_context="",
+    ):
+        with lock:
+            in_flight["n"] += 1
+            in_flight["peak"] = max(in_flight["peak"], in_flight["n"])
+        try:
+            time.sleep(0.03)
+            dst_path.write_text(f"# t{src_path.name}\n\nx\n", encoding="utf-8")
+            return "x"
+        finally:
+            with lock:
+                in_flight["n"] -= 1
+
+    monkeypatch.setattr(tr, "translate_chapter_file", fake_translate_chapter_file)
+
+    cfg = tr.TranslatorConfig(
+        api_key="x", model="m", system_prompt="p", use_prior_context=True,
+    )
+    tr.translate_folder(src, dst, cfg, max_workers=3)
+    # With context on, parallelism is forced down to 1.
+    assert in_flight["peak"] == 1, (
+        f"expected serial translate when context on, peak was {in_flight['peak']}"
+    )
+
+
+# ---- Phase 5: local file importer ----------------------------------------
+
+def test_importer_txt_with_chapter_headings(tmp_path):
+    """Heuristic split on 'Chapter N' / 'Глава N' / Markdown H1."""
+    from novel_dl.importer import import_local_file
+
+    src = tmp_path / "novel.txt"
+    src.write_text(
+        "# Глава 1: Начало\n\n"
+        "Тёмной ночью.\n\n"
+        "Chapter 2 - Action\n\n"
+        "Боевая сцена.\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out"
+    book = import_local_file(src, out)
+    assert len(book.chapters) == 2
+    files = sorted(out.glob("chapter_*.txt"))
+    assert len(files) == 2
+    assert (out / "meta.json").exists()
+
+
+def test_importer_txt_no_headings_single_chapter(tmp_path):
+    """Files without obvious chapter cues should still import as 1 chapter."""
+    from novel_dl.importer import import_local_file
+
+    src = tmp_path / "blob.txt"
+    src.write_text("Just a long blob of plain prose.\n" * 20, encoding="utf-8")
+    book = import_local_file(src, tmp_path / "out")
+    assert len(book.chapters) == 1
+    assert "blob of plain prose" in (book.chapters[0].text or "")
+
+
+def test_importer_rejects_unknown_extension(tmp_path):
+    """Anything that isn't .txt/.epub/.fb2 should error with a clear message."""
+    from novel_dl.importer import LocalImportError, import_local_file
+
+    src = tmp_path / "thing.docx"
+    src.write_text("anything", encoding="utf-8")
+    try:
+        import_local_file(src, tmp_path / "out")
+    except LocalImportError as exc:
+        assert ".docx" in str(exc) or ".txt" in str(exc)
+        return
+    raise AssertionError("expected LocalImportError on .docx input")
+
+
+def test_importer_epub_basic(tmp_path):
+    """Build a minimal valid EPUB on the fly and assert chapters round-trip."""
+    import zipfile
+
+    from novel_dl.importer import import_local_file
+
+    src = tmp_path / "tiny.epub"
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("mimetype", "application/epub+zip")
+        zf.writestr(
+            "META-INF/container.xml",
+            '<?xml version="1.0"?><container><rootfiles>'
+            '<rootfile full-path="OEBPS/content.opf" '
+            'media-type="application/oebps-package+xml"/></rootfiles>'
+            '</container>',
+        )
+        zf.writestr(
+            "OEBPS/content.opf",
+            '<package><manifest>'
+            '<item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>'
+            '<item id="ch2" href="ch2.xhtml" media-type="application/xhtml+xml"/>'
+            '</manifest><spine>'
+            '<itemref idref="ch1"/><itemref idref="ch2"/>'
+            '</spine></package>',
+        )
+        zf.writestr(
+            "OEBPS/ch1.xhtml",
+            "<html><body><h1>Prologue</h1><p>It begins here.</p></body></html>",
+        )
+        zf.writestr(
+            "OEBPS/ch2.xhtml",
+            "<html><body><h1>The End</h1><p>And then it ended.</p></body></html>",
+        )
+
+    book = import_local_file(src, tmp_path / "out")
+    assert len(book.chapters) == 2
+    assert book.chapters[0].title == "Prologue"
+    assert "begins here" in (book.chapters[0].text or "")
+    assert book.chapters[1].title == "The End"
+
+
+def test_importer_fb2_basic(tmp_path):
+    """FB2 = XML; <section>/<title> structure should yield one chapter each."""
+    from novel_dl.importer import import_local_file
+
+    src = tmp_path / "novel.fb2"
+    src.write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<FictionBook>'
+        '<body>'
+        '<section><title><p>Глава 1</p></title>'
+        '<p>Первый абзац.</p><p>Второй абзац.</p></section>'
+        '<section><title><p>Глава 2</p></title>'
+        '<p>Третий абзац.</p></section>'
+        '</body></FictionBook>',
+        encoding="utf-8",
+    )
+    book = import_local_file(src, tmp_path / "out")
+    assert len(book.chapters) == 2
+    assert "Первый абзац" in (book.chapters[0].text or "")
+
+
+# ---- Phase 5: fetch_html retry semantics ---------------------------------
+
+def test_fetch_html_does_not_retry_permanent_4xx(monkeypatch):
+    """HTTP 404 should fail fast with FetchError, no retries."""
+    import urllib.error
+
+    from novel_dl import utils as utils_mod
+
+    calls = {"n": 0}
+
+    class _FakeResp:
+        pass
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        raise urllib.error.HTTPError(
+            req.full_url, 404, "Not Found", {}, None,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(utils_mod.urllib.request, "urlopen", fake_urlopen)
+    try:
+        utils_mod.fetch_html("https://x/missing", retries=3, backoff=0)
+    except utils_mod.FetchError as exc:
+        assert "404" in str(exc)
+        assert calls["n"] == 1, "404 should NOT be retried"
+        return
+    raise AssertionError("expected FetchError on 404")
+
+
+def test_fetch_html_retries_429_then_succeeds(monkeypatch):
+    """HTTP 429 (rate limit) is transient — retry until 200."""
+    import io
+    import urllib.error
+
+    from novel_dl import utils as utils_mod
+
+    calls = {"n": 0}
+
+    class _OkResp:
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return self._body
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise urllib.error.HTTPError(
+                req.full_url, 429, "Too Many Requests", {}, None,  # type: ignore[arg-type]
+            )
+        return _OkResp(b"<html>ok</html>")
+
+    monkeypatch.setattr(utils_mod.urllib.request, "urlopen", fake_urlopen)
+    out = utils_mod.fetch_html("https://x/", retries=5, backoff=0)
+    assert "ok" in out
+    assert calls["n"] == 3
+    _ = io  # silence "imported but unused" if it ever leaks
+
+
+# ---- Phase 5: new adapter dispatch ---------------------------------------
+
+def test_royalroad_adapter_matches_url():
+    from novel_dl.adapters.royalroad import RoyalRoadAdapter
+
+    assert RoyalRoadAdapter.matches(
+        "https://www.royalroad.com/fiction/12345/some-slug"
+    )
+    assert RoyalRoadAdapter.matches(
+        "https://royalroad.com/fiction/1/x"
+    )
+    assert not RoyalRoadAdapter.matches("https://other.com/")
+
+
+def test_scribblehub_adapter_matches_url():
+    from novel_dl.adapters.scribblehub import ScribbleHubAdapter
+
+    assert ScribbleHubAdapter.matches(
+        "https://www.scribblehub.com/series/9999/some-series/"
+    )
+    assert not ScribbleHubAdapter.matches("https://royalroad.com/")
+
+
+def test_registry_dispatches_to_new_adapters():
+    from novel_dl.adapters.royalroad import RoyalRoadAdapter
+    from novel_dl.adapters.scribblehub import ScribbleHubAdapter
+    from novel_dl.registry import get_adapter
+
+    rr = get_adapter("https://www.royalroad.com/fiction/1/x")
+    sh = get_adapter("https://www.scribblehub.com/series/2/y/")
+    assert isinstance(rr, RoyalRoadAdapter)
+    assert isinstance(sh, ScribbleHubAdapter)
+
+
+def test_royalroad_fetch_book_parses_chapter_list(monkeypatch):
+    """Regex over canned HTML. Tests our parser, not RR's actual site."""
+    from novel_dl.adapters import royalroad
+    from novel_dl.adapters.royalroad import RoyalRoadAdapter
+
+    fake_html = """
+    <html><head>
+      <meta property="og:title" content="My Story | Royal Road"/>
+      <meta property="og:description" content="A tale."/>
+      <meta property="og:image" content="https://x/cover.jpg"/>
+    </head><body>
+      <h1 class="font-white">My Story</h1>
+      <a href="/profile/77">Author Name</a>
+      <a href="/fiction/123/my-story/chapter/4001/prologue">Prologue</a>
+      <a href="/fiction/123/my-story/chapter/4002/ch-1">Ch 1</a>
+      <a href="/fiction/123/my-story/chapter/4003/ch-2">Ch 2</a>
+    </body></html>
+    """
+
+    monkeypatch.setattr(
+        royalroad, "fetch_html",
+        lambda url, headers=None: fake_html,
+    )
+
+    adapter = RoyalRoadAdapter()
+    book = adapter.fetch_book("https://www.royalroad.com/fiction/123/my-story")
+    assert book.title == "My Story"
+    assert book.author == "Author Name"
+    assert len(book.chapters) == 3
+    assert book.chapters[0].url.endswith("/chapter/4001/prologue")
+
+
+def test_royalroad_fetch_chapter_extracts_body(monkeypatch):
+    from novel_dl.adapters import royalroad
+    from novel_dl.adapters.royalroad import RoyalRoadAdapter
+    from novel_dl.core import Chapter
+
+    fake_html = """
+    <html><body>
+      <h1>Chapter 1: The Beginning</h1>
+      <div class="chapter-content user-defined">
+        <p>It was a dark and stormy night.</p>
+        <p>The wind howled.</p>
+      </div>
+      <div class="comments"></div>
+    </body></html>
+    """
+    monkeypatch.setattr(
+        royalroad, "fetch_html",
+        lambda url, headers=None: fake_html,
+    )
+    adapter = RoyalRoadAdapter()
+    ch = Chapter(num=1, title="x", url="https://x/chapter/1/y")
+    out = adapter.fetch_chapter(ch)
+    assert out.title.startswith("Chapter 1")
+    assert "dark and stormy" in (out.text or "")
+
+
+def test_scribblehub_fetch_chapter_extracts_chp_raw(monkeypatch):
+    from novel_dl.adapters import scribblehub
+    from novel_dl.adapters.scribblehub import ScribbleHubAdapter
+    from novel_dl.core import Chapter
+
+    fake_html = """
+    <html><body>
+      <div class="chapter-title">Ch 1 — Hello</div>
+      <div id="chp_raw">
+        <p>Para one.</p>
+        <p>Para two.</p>
+      </div>
+      <div class="footer"></div>
+    </body></html>
+    """
+    monkeypatch.setattr(
+        scribblehub, "fetch_html",
+        lambda url, headers=None: fake_html,
+    )
+    adapter = ScribbleHubAdapter()
+    ch = Chapter(num=1, title="x", url="https://www.scribblehub.com/read/1-x/chapter/1/")
+    out = adapter.fetch_chapter(ch)
+    assert "Hello" in out.title
+    assert "Para one" in (out.text or "")
+
+
+# ---- Phase 6: Telegram bot helpers ---------------------------------------
+
+def test_bot_parse_message_classifies_inputs():
+    from novel_dl.bot import _parse_message
+
+    assert _parse_message("/start")[0] == "command"
+    assert _parse_message("/help")[0] == "command"
+    assert _parse_message("/chapters 1-20") == ("range", "1-20")
+    assert _parse_message("/chapters") == ("range", "all")
+    assert _parse_message("/lang en") == ("lang", "en")
+    assert _parse_message("/lang RU") == ("lang", "ru")
+    # Bad lang falls back to ru.
+    assert _parse_message("/lang fr") == ("lang", "ru")
+    kind, payload = _parse_message(
+        "https://www.scribblehub.com/series/9999/x/"
+    )
+    assert kind == "url"
+    assert payload.startswith("https://")
+    assert _parse_message("hello")[0] == "other"
+    assert _parse_message("")[0] == "other"
+
+
+def test_bot_main_errors_without_token(monkeypatch, capsys):
+    """The CLI should exit nonzero with a friendly message when token missing."""
+    from novel_dl import bot
+
+    monkeypatch.delenv("TG_BOT_TOKEN", raising=False)
+    rc = bot.main(["--token", ""])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "TG_BOT_TOKEN" in captured.out

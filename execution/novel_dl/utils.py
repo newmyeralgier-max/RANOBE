@@ -4,9 +4,36 @@ from __future__ import annotations
 
 import html as html_lib
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
+from typing import Callable
+
+
+def wait_if_paused(
+    pause_event: "threading.Event | None",
+    cancel_event: "threading.Event | None" = None,
+    *,
+    poll_interval: float = 0.2,
+) -> None:
+    """Block while ``pause_event`` is *clear*; respect cancellation.
+
+    Convention: ``pause_event.is_set() == True`` means the worker may
+    proceed. A clear event means "paused — wait here". This matches the
+    threading.Event docs more naturally than the inverse.
+
+    If ``cancel_event`` is set at any point we return immediately —
+    callers are expected to check the cancel event right after.
+    """
+    if pause_event is None or pause_event.is_set():
+        return
+    while not pause_event.is_set():
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        # Short polling so a Resume click feels instant; the cost of a
+        # 200ms idle wait is negligible compared to a network request.
+        time.sleep(poll_interval)
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -32,8 +59,21 @@ def fetch_html(
     timeout: float = 25.0,
     retries: int = 3,
     backoff: float = 2.0,
+    progress: "Callable[[str], None] | None" = None,
 ) -> str:
-    """GET ``url`` and return decoded HTML. Retries on transient errors."""
+    """GET ``url`` and return decoded HTML. Retries on transient errors.
+
+    Phase 5: distinguishes *transient* network errors from *permanent*
+    HTTP errors. Transient = ``URLError``/``TimeoutError``/connection
+    reset / DNS failure — these are usually a VPN flap or the server
+    momentarily refusing connections, so we retry up to ``retries``
+    with exponential ``backoff``. Permanent (4xx other than 429) =
+    request is bad and won't fix itself; we surface immediately so the
+    user can correct the URL/credentials. ``HTTP 429`` (rate limit) and
+    ``HTTP 5xx`` are treated as transient. ``progress`` is called with
+    a human-readable line on every retry so the GUI can show the user
+    why the download is stalling instead of looking frozen.
+    """
     merged = dict(DEFAULT_HEADERS)
     if headers:
         merged.update(headers)
@@ -45,8 +85,27 @@ def fetch_html(
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read()
             return raw.decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            # Permanent (won't be fixed by retrying): bail out instantly.
+            # The 429 + 5xx range is the main "the server is having a
+            # bad day" signal; everything else 4xx is on the caller.
+            if exc.code != 429 and not (500 <= exc.code < 600):
+                raise FetchError(f"GET {url} -> HTTP {exc.code}") from exc
+            last_err = exc
+            if progress and attempt < retries:
+                progress(
+                    f"GET {url} -> HTTP {exc.code}, попытка "
+                    f"{attempt}/{retries}, жду {backoff * attempt:.0f}с"
+                )
+            if attempt < retries:
+                time.sleep(backoff * attempt)
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
             last_err = exc
+            if progress and attempt < retries:
+                progress(
+                    f"GET {url} сеть упала ({exc.__class__.__name__}), попытка "
+                    f"{attempt}/{retries}, жду {backoff * attempt:.0f}с"
+                )
             if attempt < retries:
                 time.sleep(backoff * attempt)
     raise FetchError(f"GET {url} failed after {retries} attempts: {last_err}")
