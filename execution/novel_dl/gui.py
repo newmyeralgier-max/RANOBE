@@ -223,7 +223,62 @@ class NovelDownloaderApp:
         self._update_btn.pack(side="right", padx=(0, 8), pady=4)
         # _update_banner is *not* packed yet — _show_update_banner does that.
 
-        top = ttk.LabelFrame(self.root, text="1. Ссылка на книгу")
+        # ---- Scrollable body ------------------------------------------------
+        # On 1366×768 laptops the original layout could push translation
+        # controls below the visible area with no way to scroll. Wrap all
+        # configuration sections (top/info/sel/out/action/tr) into a
+        # vertically scrolling Canvas so they're always reachable.
+        # Status / progress / log stay pinned at the bottom of self.root.
+        self._scroll_canvas = tk.Canvas(
+            self.root, borderwidth=0, highlightthickness=0,
+        )
+        self._scroll_sb = ttk.Scrollbar(
+            self.root, orient="vertical",
+            command=self._scroll_canvas.yview,
+        )
+        self._scroll_canvas.configure(yscrollcommand=self._scroll_sb.set)
+        # IMPORTANT: do not pack the canvas/scrollbar yet. Pack manager
+        # assigns space in pack order, and an expand=True widget added
+        # before bottom-pinned widgets steals all space from them. We
+        # defer the actual pack to the end of _build_widgets, after the
+        # status/progress/log frame have claimed their bottom strips.
+
+        self.body = ttk.Frame(self._scroll_canvas)
+        self._body_window = self._scroll_canvas.create_window(
+            (0, 0), window=self.body, anchor="nw",
+        )
+
+        def _on_body_configure(_event: object) -> None:
+            self._scroll_canvas.configure(
+                scrollregion=self._scroll_canvas.bbox("all"),
+            )
+        self.body.bind("<Configure>", _on_body_configure)
+
+        def _on_canvas_configure(event: object) -> None:
+            # Make the inner frame match the canvas width so child widgets
+            # that pack with fill="x" actually fill the visible area.
+            self._scroll_canvas.itemconfigure(
+                self._body_window, width=event.width,
+            )
+        self._scroll_canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Mousewheel scrolling (Windows/macOS use <MouseWheel>, Linux uses
+        # <Button-4>/<Button-5>). Bind on the root so the wheel works
+        # regardless of which inner widget the cursor hovers over.
+        def _on_mousewheel(event: object) -> None:
+            delta = getattr(event, "delta", 0)
+            num = getattr(event, "num", 0)
+            if delta:
+                self._scroll_canvas.yview_scroll(int(-delta / 120), "units")
+            elif num == 4:
+                self._scroll_canvas.yview_scroll(-3, "units")
+            elif num == 5:
+                self._scroll_canvas.yview_scroll(3, "units")
+        self.root.bind_all("<MouseWheel>", _on_mousewheel)
+        self.root.bind_all("<Button-4>", _on_mousewheel)
+        self.root.bind_all("<Button-5>", _on_mousewheel)
+
+        top = ttk.LabelFrame(self.body, text="1. Ссылка на книгу")
         top.pack(fill="x", **pad)
         # Stable anchor for repacking the update banner above the rest of
         # the UI. ``winfo_children()[0]`` was the banner ITSELF (it's the
@@ -255,7 +310,7 @@ class NovelDownloaderApp:
         )
         self.import_btn.pack(side="right", padx=(0, 4), pady=8)
 
-        info = ttk.LabelFrame(self.root, text="2. Книга")
+        info = ttk.LabelFrame(self.body, text="2. Книга")
         info.pack(fill="x", **pad)
         self.book_title_var = tk.StringVar(value="— ещё ничего не загружено —")
         self.book_info_var = tk.StringVar(value="")
@@ -265,7 +320,7 @@ class NovelDownloaderApp:
             fill="x", padx=8, pady=(0, 6),
         )
 
-        sel = ttk.LabelFrame(self.root, text="3. Какие главы скачать")
+        sel = ttk.LabelFrame(self.body, text="3. Какие главы скачать")
         sel.pack(fill="x", **pad)
         row = ttk.Frame(sel)
         row.pack(fill="x", padx=8, pady=6)
@@ -311,7 +366,7 @@ class NovelDownloaderApp:
             "<Double-1>", self._on_chapter_tree_double_click,
         )
 
-        out = ttk.LabelFrame(self.root, text="4. Куда сохранять")
+        out = ttk.LabelFrame(self.body, text="4. Куда сохранять")
         out.pack(fill="x", **pad)
         out_row = ttk.Frame(out)
         out_row.pack(fill="x", padx=8, pady=6)
@@ -346,7 +401,7 @@ class NovelDownloaderApp:
             text="(1 — по одной; 3 — быстрее, но рискуешь Cloudflare)",
         ).pack(side="left", padx=(4, 0))
 
-        action = ttk.Frame(self.root)
+        action = ttk.Frame(self.body)
         action.pack(fill="x", **pad)
         self.download_btn = ttk.Button(action, text="Скачать",
                                        command=self._on_download)
@@ -366,7 +421,7 @@ class NovelDownloaderApp:
                                    command=self._on_open_folder, state="disabled")
         self.open_btn.pack(side="left", padx=(8, 0))
 
-        tr = ttk.LabelFrame(self.root, text="5. Перевод (Cohere)")
+        tr = ttk.LabelFrame(self.body, text="5. Перевод (Cohere)")
         tr.pack(fill="x", **pad)
         # Provider selector. Right now only Cohere is wired through to
         # the actual translator; the rest are visible-but-disabled stubs
@@ -615,10 +670,11 @@ class NovelDownloaderApp:
         log_frame = ttk.LabelFrame(self.root, text="Лог")
 
         # Order: progress (very bottom), status (above progress), log (above
-        # status, expands to fill the remaining vertical space).
+        # status). Log keeps its natural height (15 rows of Text) — the
+        # scrollable canvas above is what expands to claim leftover space.
         self.progress.pack(side="bottom", fill="x", padx=10, pady=(0, 4))
         self.status_label.pack(side="bottom", fill="x", padx=10, pady=(0, 2))
-        log_frame.pack(side="bottom", fill="both", expand=True, **pad)
+        log_frame.pack(side="bottom", fill="x", **pad)
 
         # Toolbar row inside the log frame: "Open log file" button so the
         # user can hand the .log straight to me when something breaks
@@ -643,6 +699,12 @@ class NovelDownloaderApp:
         log_sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
         log_sb.pack(side="right", fill="y", pady=(4, 8), padx=(0, 8))
         self.log.configure(yscrollcommand=log_sb.set)
+
+        # Pack the scrollable body LAST, so log/status/progress have already
+        # claimed their bottom strips. The canvas (with expand=True) then
+        # fills whatever vertical space remains in the middle.
+        self._scroll_sb.pack(side="right", fill="y")
+        self._scroll_canvas.pack(side="top", fill="both", expand=True)
 
     # ---- state transitions ---------------------------------------------
     def _set_state_idle(self) -> None:
@@ -1762,7 +1824,14 @@ class NovelDownloaderApp:
                 "border": "#cccccc",
             }
         self.root.configure(bg=palette["bg"])
-        # ttk widget colour overrides. On the native (vista/aqua)
+        # Match the scrollable canvas to the theme so the inner Frame's
+        # background blends in (otherwise dark mode shows a white strip
+        # behind sections that don't fill the full width).
+        try:
+            self._scroll_canvas.configure(bg=palette["bg"])
+        except (AttributeError, tk.TclError):
+            pass
+        # ttk widget overrides. On the native (vista/aqua)
         # themes most of these are no-ops, which is what we want — light
         # mode then keeps the OS look.
         for cls in (

@@ -1546,6 +1546,31 @@ def test_bot_parse_message_classifies_inputs():
     assert _parse_message("")[0] == "other"
 
 
+def test_bot_parse_message_strips_bot_username():
+    """Group-style /command@botname suffixes must not poison the payload."""
+    from novel_dl.bot import _parse_message
+
+    assert _parse_message("/chapters@ranobe1231_bot 5-10") == ("range", "5-10")
+    assert _parse_message("/lang@ranobe1231_bot en") == ("lang", "en")
+    assert _parse_message("/help@ranobe1231_bot")[0] == "command"
+    assert _parse_message("/start@ranobe1231_bot")[0] == "command"
+
+
+def test_bot_transient_errors_set_includes_remote_disconnected():
+    """RemoteDisconnected (subclass of HTTPException, not URLError) must be
+    in the retry-allow-list so the bot doesn't crash on a flaky link.
+    """
+    import http.client
+
+    from novel_dl.bot import _TRANSIENT_NET_ERRORS
+
+    assert http.client.RemoteDisconnected in _TRANSIENT_NET_ERRORS
+    # And subclasses get caught too — RemoteDisconnected inherits from
+    # ConnectionResetError which is also in the tuple.
+    assert ConnectionResetError in _TRANSIENT_NET_ERRORS
+    assert TimeoutError in _TRANSIENT_NET_ERRORS
+
+
 def test_bot_main_errors_without_token(monkeypatch, capsys):
     """The CLI should exit nonzero with a friendly message when token missing."""
     from novel_dl import bot
